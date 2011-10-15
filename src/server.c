@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <string.h>
+#include "client_node.h"
 
 static const int MAX_PENDING = 5;
 
@@ -16,6 +17,13 @@ int main(int argc, char **argv) {
 	struct sockaddr_in serverAddr;
 	short listenPort;
 	long listenAddr;
+
+	client_root *clients = malloc(sizeof(client_root));
+	if (clients == NULL) {
+		perror("Could not malloc");
+		exit(-1);
+	}
+	memset(clients, 0, sizeof(client_root));
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s config_file\n", argv[0]);
@@ -54,7 +62,7 @@ int main(int argc, char **argv) {
 		exit(-1);
 	}
 
-	for (int i = 0; i < 5; i++) {
+	while (1) {
 		struct sockaddr_in clientAddr;
 		socklen_t clientAddrLen = sizeof(clientAddr);
 		int h_client;
@@ -64,9 +72,16 @@ int main(int argc, char **argv) {
 			exit(-1);
 		}
 
-		printf("Accepted client %d\n", i + 1);
+		client_node *node = create_node(clients);
+		if (node == NULL) {
+			perror("Could not malloc");
+			continue;
+		}
+
+		node->h_socket = h_client;
+		printf("Accepted client %d\n", clients->count);
+
 		send(h_client, "Hello\n", 7, 0);
-		close(h_client);
 	}
 
 	return 0;
