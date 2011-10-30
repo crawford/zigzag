@@ -83,8 +83,6 @@ int main(int argc, char **argv) {
 				continue;
 		}
 
-		printf("Something happened\n");
-
 		struct pollfd *fd = fds;
 		// Check the first file descriptor (the listening socket) for readable
 		if (fd->revents) {
@@ -100,11 +98,6 @@ int main(int argc, char **argv) {
 			}
 			result--;
 		}
-
-		// Make sure we have any client sockets to check
-		//if (nfds <= 1) {
-		//	continue;
-		//}
 
 		// Check the remaining file descriptors (the client sockets) for events
 		char dirty = 0;
@@ -139,6 +132,7 @@ int main(int argc, char **argv) {
 			}
 		}
 
+		// Rebuild the file descriptor list if the list of client sockets has changed
 		if (dirty) {
 			rebuild_fds(&fds, &nfds, clients);
 		}
@@ -174,14 +168,12 @@ int accept_connection(int h_sock, client_root *clients) {
 }
 
 int append_to_fds(struct pollfd **fds, nfds_t *size, int fd) {
-	struct pollfd *new = malloc(sizeof(struct pollfd) * (*size + 1));
+	struct pollfd *new = realloc(*fds, sizeof(struct pollfd) * (*size + 1));
 	if (new == NULL) {
 		perror("malloc()");
 		return -1;
 	}
 
-	memcpy(new, *fds, (*size) * sizeof(struct pollfd));
-	free(*fds);
 	*fds = new;
 
 	(*fds)[*size].fd = fd;
@@ -193,25 +185,19 @@ int append_to_fds(struct pollfd **fds, nfds_t *size, int fd) {
 }
 
 int rebuild_fds(struct pollfd **fds, nfds_t *size, client_root *clients) {
-	struct pollfd *new = malloc((clients->count + 1) * sizeof(struct pollfd));
+	struct pollfd *new = realloc(*fds, (clients->count + 1) * sizeof(struct pollfd));
 	if (new == NULL) {
 		perror("malloc()");
 		return -1;
 	}
 
-	// Copy the listening socket to the new list of file descriptors
-	new[0].fd = (*fds)[0].fd;
-	new[0].events = (*fds)[0].events;
-
-	// Swap out the old for the new list
-	free(*fds);
 	*fds = new;
 	*size = clients->count + 1;
 
 	// Iterate through all of the connected nodes and create file descriptor
 	// entries for them.
 	client_node *node = clients->head;
-	struct pollfd *fd = new + 1;
+	struct pollfd *fd = *fds + 1;
 	while (node) {
 		fd->fd = node->h_socket;
 		fd->events = POLLIN;
