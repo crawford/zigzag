@@ -10,12 +10,28 @@
 #include "client_node.h"
 
 static const int MAX_PENDING = 5;
+static const int READ_BUF_LEN = 100;
+static const char *MESSAGE_DELIMITER = " ";
+static const char MESSAGE_TERMINATOR = '\n';
+static const char *MESSAGE_SUB = "sub";
+static const char *MESSAGE_SEND = "send";
+
+static inline void DISCONNECT(client_root *clients, int fd) {
+	printf("Disconnected\n");
+
+	destroy_node_by_fd(clients, fd);
+
+	close(fd);
+}
 
 void handle_sigterm();
 int setup_listening_socket(uint32_t, uint16_t);
 int accept_connection(int, client_root *);
 int append_to_fds(struct pollfd **, nfds_t *, int);
 int rebuild_fds(struct pollfd **, nfds_t *, client_root *);
+void process_client_message(client_node *, char *);
+client_node *find_client_by_fd(client_root *, int fd);
+int verify_zid(char *);
 
 char running = 1;
 
@@ -109,25 +125,29 @@ int main(int argc, char **argv) {
 					fprintf(stderr, "Error occured on the socket\n");
 				}
 				if (fd->revents & POLLHUP) {
-					printf("Disconnected\n");
-
-					destroy_node_by_fd(clients, fd->fd);
+					DISCONNECT(clients, fd->fd);
 					dirty = 1;
-
-					close(fd->fd);
 					continue;
 				}
 				if (fd->revents & POLLIN) {
-					char buf[100];
-					int result = read(fd->fd, &buf, 101);
+					char buf[READ_BUF_LEN];
+					int result = read(fd->fd, &buf, READ_BUF_LEN - 1);
 
 					if (result == -1) {
 						perror("read()");
 						continue;
 					}
 
-					buf[result] = 0;
-					printf("%s\n", buf);
+					if (result == 0) {
+						DISCONNECT(clients, fd->fd);
+						dirty = 1;
+						continue;
+					}
+
+					if (buf[result - 1] == MESSAGE_TERMINATOR) {
+						buf[result - 1] = '\0';
+						process_client_message(find_client_by_fd(clients, fd->fd), buf);
+					}
 				}
 			}
 		}
@@ -198,7 +218,7 @@ int rebuild_fds(struct pollfd **fds, nfds_t *size, client_root *clients) {
 	// entries for them.
 	client_node *node = clients->head;
 	struct pollfd *fd = *fds + 1;
-	while (node) {
+	while (node != NULL) {
 		fd->fd = node->h_socket;
 		fd->events = POLLIN;
 
@@ -247,5 +267,43 @@ void handle_sigterm(int sig) {
 	(void)sig;
 	running = 0;
 	printf("Terminating daemon\n");
+}
+
+void process_client_message(client_node *client, char *message) {
+	char *command = strtok(message, MESSAGE_DELIMITER);
+	char *argument = strtok(NULL, MESSAGE_DELIMITER);
+	char *payload = strtok(NULL, MESSAGE_DELIMITER);
+
+	if (strcmp(command, MESSAGE_SEND) == 0) {
+		if (verify_zid(argument)) {
+			if (payload != NULL) {
+				printf("Sending message (%s) to zigbee (%s)\n", payload, argument);
+			}
+		}
+
+	} else if (strcmp(command, MESSAGE_SUB) == 0) {
+		int channel = atoi(argument);
+		printf("Subscribing %x to channel %d\n", client, channel);
+	} else {
+		printf("Unrecognized command '%s'\n", command);
+	}
+}
+
+client_node *find_client_by_fd(client_root *root, int fd) {
+	client_node *node = root->head;
+
+	while (node != NULL) {
+		if (node->h_socket == fd) {
+			return node;
+		}
+		node = node->next;
+	}
+
+	return NULL;
+}
+
+int verify_zid(char *strzid) {
+	(void)strzid;
+	return 1;
 }
 
