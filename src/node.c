@@ -1,8 +1,8 @@
 #include <stdlib.h>
-#include "client_node.h"
+#include "node.h"
 
-client_node *create_node(client_root *root) {
-	client_node *new = malloc(sizeof(client_node));
+node *create_node(node_root *root) {
+	node *new = malloc(sizeof(node));
 	new->next = NULL;
 	new->prev = root->tail;
 
@@ -20,7 +20,7 @@ client_node *create_node(client_root *root) {
 	return new;
 }
 
-void destroy_node_by_node(client_root *root, client_node *node) {
+void destroy_node(node_root *root, node *node) {
 	if (node == NULL) {
 		return;
 	}
@@ -47,16 +47,5 @@ void destroy_node_by_node(client_root *root, client_node *node) {
 	root->count--;
 
 	free(node);
-}
-
-void destroy_node_by_fd(client_root *root, int fd) {
-	client_node *node = root->head;
-	while (node) {
-		if (node->h_socket == fd) {
-			destroy_node_by_node(root, node);
-			return;
-		}
-		node = node->next;
-	}
 }
 

@@ -8,7 +8,8 @@
 #include <signal.h>
 #include <poll.h>
 #include <errno.h>
-#include "client_node.h"
+#include "node.h"
+#include "connection.h"
 
 static const int MAX_PENDING = 5;
 static const int READ_BUF_LEN = 100;
@@ -17,22 +18,23 @@ static const char MESSAGE_TERMINATOR = '\n';
 static const char *MESSAGE_SUB = "sub";
 static const char *MESSAGE_SEND = "send";
 
-static inline void DISCONNECT(client_root *clients, int fd) {
+void handle_sigterm();
+int setup_listening_socket(uint32_t, uint16_t);
+int accept_connection(int, node_root *);
+int append_to_fds(struct pollfd **, nfds_t *, int);
+int rebuild_fds(struct pollfd **, nfds_t *, node_root *);
+void process_client_message(node *, char *);
+node *find_client_by_fd(node_root *, int fd);
+int verify_zid(char *);
+void destroy_node_by_fd(node_root *, int);
+
+static inline void DISCONNECT(node_root *clients, int fd) {
 	printf("Disconnected\n");
 
 	destroy_node_by_fd(clients, fd);
 
 	close(fd);
 }
-
-void handle_sigterm();
-int setup_listening_socket(uint32_t, uint16_t);
-int accept_connection(int, client_root *);
-int append_to_fds(struct pollfd **, nfds_t *, int);
-int rebuild_fds(struct pollfd **, nfds_t *, client_root *);
-void process_client_message(client_node *, char *);
-client_node *find_client_by_fd(client_root *, int fd);
-int verify_zid(char *);
 
 char running = 1;
 
@@ -61,12 +63,12 @@ int main(int argc, char **argv) {
 		exit(-1);
 	}
 
-	client_root *clients = malloc(sizeof(client_root));
+	node_root *clients = malloc(sizeof(node_root));
 	if (clients == NULL) {
 		perror("malloc()");
 		exit(-1);
 	}
-	memset(clients, 0, sizeof(client_root));
+	memset(clients, 0, sizeof(node_root));
 
 	// Open and parse the config file
 	configName = argv[1];
@@ -110,7 +112,7 @@ int main(int argc, char **argv) {
 					// so send an error and disconnect
 					send(h_client, "Fuck\n", 5, 0);
 					close(h_client);
-					destroy_node_by_node(clients, clients->tail);
+					destroy_node(clients, clients->tail);
 				}
 			}
 			result--;
@@ -164,7 +166,7 @@ int main(int argc, char **argv) {
 	return 0;
 }
 
-int accept_connection(int h_sock, client_root *clients) {
+int accept_connection(int h_sock, node_root *clients) {
 	struct sockaddr_in clientAddr;
 	socklen_t clientAddrLen = sizeof(clientAddr);
 	int h_client;
@@ -174,13 +176,20 @@ int accept_connection(int h_sock, client_root *clients) {
 		exit(-1);
 	}
 
-	client_node *node = create_node(clients);
+	node *node = create_node(clients);
 	if (node == NULL) {
 		perror("malloc()");
 		return -1;
 	}
 
-	node->h_socket = h_client;
+	node->data = malloc(sizeof(connection));
+	if (node->data == NULL) {
+		perror("malloc()");
+		destroy_node(clients, node);
+		return -1;
+	}
+	((connection *)node->data)->h_socket = h_client;
+
 	printf("Accepted client %d\n", clients->count);
 
 	send(h_client, "Hello\n", 7, 0);
@@ -205,7 +214,7 @@ int append_to_fds(struct pollfd **fds, nfds_t *size, int fd) {
 	return 0;
 }
 
-int rebuild_fds(struct pollfd **fds, nfds_t *size, client_root *clients) {
+int rebuild_fds(struct pollfd **fds, nfds_t *size, node_root *clients) {
 	struct pollfd *new = realloc(*fds, (clients->count + 1) * sizeof(struct pollfd));
 	if (new == NULL) {
 		perror("malloc()");
@@ -217,10 +226,10 @@ int rebuild_fds(struct pollfd **fds, nfds_t *size, client_root *clients) {
 
 	// Iterate through all of the connected nodes and create file descriptor
 	// entries for them.
-	client_node *node = clients->head;
+	node *node = clients->head;
 	struct pollfd *fd = *fds + 1;
 	while (node != NULL) {
-		fd->fd = node->h_socket;
+		fd->fd = ((connection *)node->data)->h_socket;
 		fd->events = POLLIN;
 
 		fd++;
@@ -270,7 +279,7 @@ void handle_sigterm(int sig) {
 	printf("Terminating daemon\n");
 }
 
-void process_client_message(client_node *client, char *message) {
+void process_client_message(node *client, char *message) {
 	char *command = strtok(message, MESSAGE_DELIMITER);
 	char *argument = strtok(NULL, MESSAGE_DELIMITER);
 	char *payload = strtok(NULL, MESSAGE_DELIMITER);
@@ -306,11 +315,11 @@ void process_client_message(client_node *client, char *message) {
 	}
 }
 
-client_node *find_client_by_fd(client_root *root, int fd) {
-	client_node *node = root->head;
+node *find_client_by_fd(node_root *root, int fd) {
+	node *node = root->head;
 
 	while (node != NULL) {
-		if (node->h_socket == fd) {
+		if (((connection *)node->data)->h_socket == fd) {
 			return node;
 		}
 		node = node->next;
@@ -322,5 +331,16 @@ client_node *find_client_by_fd(client_root *root, int fd) {
 int verify_zid(char *strzid) {
 	(void)strzid;
 	return 1;
+}
+
+void destroy_node_by_fd(node_root *root, int fd) {
+	node *node = root->head;
+	while (node) {
+		if (((connection *)node->data)->h_socket == fd) {
+			destroy_node(root, node);
+			return;
+		}
+		node = node->next;
+	}
 }
 
