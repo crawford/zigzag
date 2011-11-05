@@ -7,6 +7,7 @@
 #include <string.h>
 #include <signal.h>
 #include <poll.h>
+#include <errno.h>
 #include "client_node.h"
 
 static const int MAX_PENDING = 5;
@@ -274,16 +275,32 @@ void process_client_message(client_node *client, char *message) {
 	char *argument = strtok(NULL, MESSAGE_DELIMITER);
 	char *payload = strtok(NULL, MESSAGE_DELIMITER);
 
-	if (strcmp(command, MESSAGE_SEND) == 0) {
+	if (command != NULL && strcmp(command, MESSAGE_SEND) == 0) {
 		if (verify_zid(argument)) {
 			if (payload != NULL) {
 				printf("Sending message (%s) to zigbee (%s)\n", payload, argument);
+			} else {
+				printf("No payload specified\n");
 			}
+		} else {
+			printf("Invalid ZID (%s)\n", argument);
 		}
+	} else if (command != NULL && strcmp(command, MESSAGE_SUB) == 0) {
+		int channel;
+		char *remaining;
+		errno = 0;
 
-	} else if (strcmp(command, MESSAGE_SUB) == 0) {
-		int channel = atoi(argument);
-		printf("Subscribing %x to channel %d\n", client, channel);
+		if (argument != NULL) {
+			channel = (int)strtol(argument, &remaining, 10);
+		}
+		if (argument == NULL || *remaining != '\0' || errno) {
+			printf("Invalid channel number\n");
+			if (errno) {
+				perror("strtol");
+			}
+		} else {
+			printf("Subscribing %x to channel %d\n", client, channel);
+		}
 	} else {
 		printf("Unrecognized command '%s'\n", command);
 	}
