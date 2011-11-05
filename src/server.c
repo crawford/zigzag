@@ -10,6 +10,7 @@
 #include <errno.h>
 #include "node.h"
 #include "connection.h"
+#include "channel.h"
 
 static const int MAX_PENDING = 5;
 static const int READ_BUF_LEN = 100;
@@ -23,15 +24,30 @@ int setup_listening_socket(uint32_t, uint16_t);
 int accept_connection(int, node_root *);
 int append_to_fds(struct pollfd **, nfds_t *, int);
 int rebuild_fds(struct pollfd **, nfds_t *, node_root *);
-void process_client_message(node *, char *);
-node *find_client_by_fd(node_root *, int fd);
+void process_client_message(node_root *, node *, char *);
+node *find_client_by_fd(node_root *, int);
+node *find_channel_by_id(node_root *, int);
 int verify_zid(char *);
 void destroy_node_by_fd(node_root *, int);
 
-static inline void DISCONNECT(node_root *clients, int fd) {
+static inline void DISCONNECT(node_root *clients, node_root *channels, int fd) {
 	printf("Disconnected\n");
 
 	destroy_node_by_fd(clients, fd);
+
+	// Remove the client from all of the channel subscriptions
+	node *node = channels->head;
+	while (node != NULL) {
+		destroy_node_by_fd(((channel *)node->data)->subscribers, fd);
+
+		// Remove the channel if it is empty
+		if (((channel *)node->data)->subscribers->count == 0) {
+			printf("Removing empty channel (%d)\n", ((channel *)node->data)->id);
+			destroy_node(channels, node);
+		}
+		node = node->next;
+	}
+
 
 	close(fd);
 }
@@ -49,6 +65,9 @@ int main(int argc, char **argv) {
 	struct pollfd *fds = NULL;
 	nfds_t nfds = 0;
 
+	node_root *clients;
+	node_root *channels;
+
 	if (signal(SIGINT, handle_sigterm) == SIG_ERR) {
 		perror("signal()");
 		exit(-1);
@@ -63,12 +82,21 @@ int main(int argc, char **argv) {
 		exit(-1);
 	}
 
-	node_root *clients = malloc(sizeof(node_root));
+	// Create the list of client connections
+	clients = malloc(sizeof(node_root));
 	if (clients == NULL) {
 		perror("malloc()");
 		exit(-1);
 	}
 	memset(clients, 0, sizeof(node_root));
+
+	// Create the list of channels
+	channels = malloc(sizeof(node_root));
+	if (channels == NULL) {
+		perror("malloc()");
+		exit(-1);
+	}
+	memset(channels, 0, sizeof(node_root));
 
 	// Open and parse the config file
 	configName = argv[1];
@@ -128,7 +156,7 @@ int main(int argc, char **argv) {
 					fprintf(stderr, "Error occured on the socket\n");
 				}
 				if (fd->revents & POLLHUP) {
-					DISCONNECT(clients, fd->fd);
+					DISCONNECT(clients, channels, fd->fd);
 					dirty = 1;
 					continue;
 				}
@@ -142,14 +170,14 @@ int main(int argc, char **argv) {
 					}
 
 					if (result == 0) {
-						DISCONNECT(clients, fd->fd);
+						DISCONNECT(clients, channels, fd->fd);
 						dirty = 1;
 						continue;
 					}
 
 					if (buf[result - 1] == MESSAGE_TERMINATOR) {
 						buf[result - 1] = '\0';
-						process_client_message(find_client_by_fd(clients, fd->fd), buf);
+						process_client_message(channels, find_client_by_fd(clients, fd->fd), buf);
 					}
 				}
 			}
@@ -279,7 +307,7 @@ void handle_sigterm(int sig) {
 	printf("Terminating daemon\n");
 }
 
-void process_client_message(node *client, char *message) {
+void process_client_message(node_root *channels, node *client, char *message) {
 	char *command = strtok(message, MESSAGE_DELIMITER);
 	char *argument = strtok(NULL, MESSAGE_DELIMITER);
 	char *payload = strtok(NULL, MESSAGE_DELIMITER);
@@ -295,12 +323,12 @@ void process_client_message(node *client, char *message) {
 			printf("Invalid ZID (%s)\n", argument);
 		}
 	} else if (command != NULL && strcmp(command, MESSAGE_SUB) == 0) {
-		int channel;
+		int channel_id;
 		char *remaining;
 		errno = 0;
 
 		if (argument != NULL) {
-			channel = (int)strtol(argument, &remaining, 10);
+			channel_id = (int)strtol(argument, &remaining, 10);
 		}
 		if (argument == NULL || *remaining != '\0' || errno) {
 			printf("Invalid channel number\n");
@@ -308,7 +336,36 @@ void process_client_message(node *client, char *message) {
 				perror("strtol");
 			}
 		} else {
-			printf("Subscribing %x to channel %d\n", client, channel);
+			node *channel_node = find_channel_by_id(channels, channel_id);
+			if (channel_node == NULL) {
+				// Couldn't find the specified channel, so create it
+				channel *channel = create_channel(channel_id);
+				if (channel == NULL) {
+					printf("Couldn't create channel (%d)\n", channel_id);
+					return;
+				}
+				channel_node = create_node(channels);
+				if (channel_node == NULL) {
+					printf("Couldn't create channel (%d)\n", channel_id);
+					return;
+				}
+				channel_node->data = channel;
+				printf("Created channel (%d)\n", channel_id);
+			} else {
+				// Check to make sure that the client hasn't
+				// already subscribed to this channel
+				destroy_node_by_fd(((channel *)channel_node->data)->subscribers, ((connection *)client->data)->h_socket);
+			}
+
+			node *subscriber_node = create_node(((channel *)channel_node->data)->subscribers);
+			if (subscriber_node == NULL) {
+				printf("Couldn't add subscriber to channel\n");
+				return;
+			}
+			printf("Subscribed %x to channel %d\n", client, channel_id);
+			subscriber_node->data = client->data;
+
+			printf("%d clients subscribed to channel %d\n", ((channel *)channel_node->data)->subscribers->count, channel_id);
 		}
 	} else {
 		printf("Unrecognized command '%s'\n", command);
@@ -320,6 +377,19 @@ node *find_client_by_fd(node_root *root, int fd) {
 
 	while (node != NULL) {
 		if (((connection *)node->data)->h_socket == fd) {
+			return node;
+		}
+		node = node->next;
+	}
+
+	return NULL;
+}
+
+node *find_channel_by_id(node_root *root, int id) {
+	node *node = root->head;
+
+	while (node != NULL) {
+		if (((channel *)node->data)->id == id) {
 			return node;
 		}
 		node = node->next;

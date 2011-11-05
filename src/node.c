@@ -3,6 +3,9 @@
 
 node *create_node(node_root *root) {
 	node *new = malloc(sizeof(node));
+	if (new == NULL)
+		return NULL;
+
 	new->next = NULL;
 	new->prev = root->tail;
 
