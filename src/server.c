@@ -14,7 +14,8 @@
 
 static const int MAX_PENDING = 5;
 static const int READ_BUF_LEN = 100;
-static const char *MESSAGE_DELIMITER = " ";
+static const char *MESSAGE_DELIMITER_S = " ";
+static const char MESSAGE_DELIMITER_C = ' ';
 static const char MESSAGE_TERMINATOR = '\n';
 static const char *MESSAGE_SUB = "sub";
 static const char *MESSAGE_SEND = "send";
@@ -29,33 +30,14 @@ node *find_client_by_fd(node_root *, int);
 node *find_channel_by_id(node_root *, int);
 int verify_zid(char *);
 void destroy_node_by_fd(node_root *, int);
+void disconnect(node_root *, node_root *, int);
 
-static inline void DISCONNECT(node_root *clients, node_root *channels, int fd) {
-	printf("Disconnected\n");
-
-	destroy_node_by_fd(clients, fd);
-
-	// Remove the client from all of the channel subscriptions
-	node *node = channels->head;
-	while (node != NULL) {
-		destroy_node_by_fd(((channel *)node->data)->subscribers, fd);
-
-		// Remove the channel if it is empty
-		if (((channel *)node->data)->subscribers->count == 0) {
-			printf("Removing empty channel (%d)\n", ((channel *)node->data)->id);
-			destroy_node(channels, node);
-		}
-		node = node->next;
-	}
-
-
-	close(fd);
-}
 
 char running = 1;
 
 int main(int argc, char **argv) {
 	int h_sock;
+	int h_zigbee;
 	int h_config;
 	char *configName = NULL;
 
@@ -110,15 +92,37 @@ int main(int argc, char **argv) {
 
 	h_sock = setup_listening_socket(listenAddr, listenPort);
 
-	fds = malloc(sizeof(struct pollfd));
+	// THIS IS TEST CODE BECAUSE I DON'T HAVE A DEVICE
+	//#############
+	struct sockaddr_in serverAddr;
+	if ((h_zigbee = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+		perror("socket()");
+		exit(-1);
+	}
+	memset(&serverAddr, 0, sizeof(serverAddr));
+	serverAddr.sin_family = AF_INET;
+	serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+	serverAddr.sin_port = htons(9000);
+
+	if (connect(h_zigbee, (struct sockaddr *) &serverAddr, sizeof(serverAddr)) < 0) {
+		perror("connect()");
+		exit(-1);
+	}
+	//#############
+
+	fds = malloc(2 * sizeof(struct pollfd));
 	if (fds == NULL) {
 		perror("malloc()");
 		exit(-1);
 	}
-	nfds = 1;
+	nfds = 2;
 
 	fds[0].fd = h_sock;
 	fds[0].events = POLLIN;
+
+	fds[1].fd = h_zigbee;
+	fds[1].events = POLLIN;
+
 
 	while (running) {
 		int result = poll(fds, nfds, 1000);
@@ -146,6 +150,46 @@ int main(int argc, char **argv) {
 			result--;
 		}
 
+		fd++;
+		// Check the second file descriptor (the zigbee pipe) for readable
+		if (fd->revents) {
+			if (fd->revents & POLLIN) {
+				char buf[READ_BUF_LEN];
+				int result = read(fd->fd, &buf, READ_BUF_LEN - 1);
+
+				if (result == -1) {
+					perror("read()");
+				} else if (result == 0) {
+					printf("Zigbee pipe is broken\n");
+				} else {
+					// Check to make sure that the message has:
+					//  a 2-byte channel id
+					//  a message delimiter
+					//  at least a 1-byte message
+					if (buf[2] != MESSAGE_DELIMITER_C || buf[result - 1] != MESSAGE_TERMINATOR || result < 5) {
+						printf("Malformed message received from zigbee\n");
+					} else {
+						buf[result - 1] = '\0';
+						printf("Read from zigbee (%s)\n", buf);
+
+						// Channel IDs (2 bytes) use network endian-ness
+						short channel_id = ntohs(*((short *)buf));
+						char *message = buf + 3;
+
+						node *channel_node = find_channel_by_id(channels, channel_id);
+						if (channel_node != NULL) {
+							node *client = ((channel *)channel_node->data)->subscribers->head;
+							while (client != NULL) {
+								send(((connection *)client->data)->h_socket, message, result - 3, 0);
+								client = client->next;
+							}
+						}
+					}
+				}
+			}
+			result--;
+		}
+
 		// Check the remaining file descriptors (the client sockets) for events
 		char dirty = 0;
 		while (++fd, result > 0) {
@@ -156,7 +200,7 @@ int main(int argc, char **argv) {
 					fprintf(stderr, "Error occured on the socket\n");
 				}
 				if (fd->revents & POLLHUP) {
-					DISCONNECT(clients, channels, fd->fd);
+					disconnect(clients, channels, fd->fd);
 					dirty = 1;
 					continue;
 				}
@@ -170,7 +214,7 @@ int main(int argc, char **argv) {
 					}
 
 					if (result == 0) {
-						DISCONNECT(clients, channels, fd->fd);
+						disconnect(clients, channels, fd->fd);
 						dirty = 1;
 						continue;
 					}
@@ -255,7 +299,7 @@ int rebuild_fds(struct pollfd **fds, nfds_t *size, node_root *clients) {
 	// Iterate through all of the connected nodes and create file descriptor
 	// entries for them.
 	node *node = clients->head;
-	struct pollfd *fd = *fds + 1;
+	struct pollfd *fd = *fds + 2;
 	while (node != NULL) {
 		fd->fd = ((connection *)node->data)->h_socket;
 		fd->events = POLLIN;
@@ -308,9 +352,9 @@ void handle_sigterm(int sig) {
 }
 
 void process_client_message(node_root *channels, node *client, char *message) {
-	char *command = strtok(message, MESSAGE_DELIMITER);
-	char *argument = strtok(NULL, MESSAGE_DELIMITER);
-	char *payload = strtok(NULL, MESSAGE_DELIMITER);
+	char *command = strtok(message, MESSAGE_DELIMITER_S);
+	char *argument = strtok(NULL, MESSAGE_DELIMITER_S);
+	char *payload = strtok(NULL, MESSAGE_DELIMITER_S);
 
 	if (command != NULL && strcmp(command, MESSAGE_SEND) == 0) {
 		if (verify_zid(argument)) {
@@ -412,5 +456,27 @@ void destroy_node_by_fd(node_root *root, int fd) {
 		}
 		node = node->next;
 	}
+}
+
+void disconnect(node_root *clients, node_root *channels, int fd) {
+	printf("Disconnected\n");
+
+	destroy_node_by_fd(clients, fd);
+
+	// Remove the client from all of the channel subscriptions
+	node *node = channels->head;
+	while (node != NULL) {
+		destroy_node_by_fd(((channel *)node->data)->subscribers, fd);
+
+		// Remove the channel if it is empty
+		if (((channel *)node->data)->subscribers->count == 0) {
+			printf("Removing empty channel (%d)\n", ((channel *)node->data)->id);
+			destroy_node(channels, node);
+		}
+		node = node->next;
+	}
+
+
+	close(fd);
 }
 
