@@ -448,13 +448,15 @@ int verify_zid(char *strzid) {
 }
 
 void destroy_node_by_fd(node_root *root, int fd) {
-	node *node = root->head;
-	while (node) {
-		if (((connection *)node->data)->h_socket == fd) {
-			destroy_node(root, node);
+	node *next = root->head;
+	while (next != NULL) {
+		node *cur = next;
+		next = cur->next;
+
+		if (((connection *)cur->data)->h_socket == fd) {
+			destroy_node(root, cur);
 			return;
 		}
-		node = node->next;
 	}
 }
 
@@ -464,16 +466,18 @@ void disconnect(node_root *clients, node_root *channels, int fd) {
 	destroy_node_by_fd(clients, fd);
 
 	// Remove the client from all of the channel subscriptions
-	node *node = channels->head;
-	while (node != NULL) {
-		destroy_node_by_fd(((channel *)node->data)->subscribers, fd);
+	node *next = channels->head;
+	while (next != NULL) {
+		node *cur = next;
+		next = cur->next;
+
+		destroy_node_by_fd(((channel *)cur->data)->subscribers, fd);
 
 		// Remove the channel if it is empty
-		if (((channel *)node->data)->subscribers->count == 0) {
-			printf("Removing empty channel (%d)\n", ((channel *)node->data)->id);
-			destroy_node(channels, node);
+		if (((channel *)cur->data)->subscribers->count == 0) {
+			printf("Removing empty channel (%d)\n", ((channel *)cur->data)->id);
+			destroy_node(channels, cur);
 		}
-		node = node->next;
 	}
 
 
