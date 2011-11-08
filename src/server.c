@@ -287,14 +287,14 @@ int append_to_fds(struct pollfd **fds, nfds_t *size, int fd) {
 }
 
 int rebuild_fds(struct pollfd **fds, nfds_t *size, node_root *clients) {
-	struct pollfd *new = realloc(*fds, (clients->count + 1) * sizeof(struct pollfd));
+	struct pollfd *new = realloc(*fds, (clients->count + 2) * sizeof(struct pollfd));
 	if (new == NULL) {
 		perror("malloc()");
 		return -1;
 	}
 
 	*fds = new;
-	*size = clients->count + 1;
+	*size = clients->count + 2;
 
 	// Iterate through all of the connected nodes and create file descriptor
 	// entries for them.
