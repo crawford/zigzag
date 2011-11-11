@@ -28,7 +28,7 @@ int rebuild_fds(struct pollfd **, nfds_t *, node_root *);
 void process_client_message(node_root *, node *, char *);
 node *find_client_by_fd(node_root *, int);
 node *find_channel_by_id(node_root *, int);
-int verify_zid(char *);
+int convert_zid(char *, uint64_t *);
 void destroy_node_by_fd(node_root *, int);
 void disconnect(node_root *, node_root *, int);
 
@@ -357,9 +357,10 @@ void process_client_message(node_root *channels, node *client, char *message) {
 	char *payload = strtok(NULL, MESSAGE_DELIMITER_S);
 
 	if (command != NULL && strcmp(command, MESSAGE_SEND) == 0) {
-		if (verify_zid(argument)) {
+		uint64_t zid;
+		if (convert_zid(argument, &zid)) {
 			if (payload != NULL) {
-				printf("Sending message (%s) to zigbee (%s)\n", payload, argument);
+				printf("Sending message (%s) to zigbee (0x%lX)\n", payload, (long unsigned int)zid);
 			} else {
 				printf("No payload specified\n");
 			}
@@ -442,8 +443,23 @@ node *find_channel_by_id(node_root *root, int id) {
 	return NULL;
 }
 
-int verify_zid(char *strzid) {
-	(void)strzid;
+// Note: This assumes that the 'long' type is at least 8 bytes
+int convert_zid(char *strzid, uint64_t *zid) {
+	char *end;
+	long tzid;
+
+	errno = 0;
+	tzid = strtol(strzid, &end, 16);
+
+	if (errno || *end != '\0' || strlen(strzid) != 16) {
+		printf("Invalid Zigbee Address\n");
+		if (errno) {
+			perror("strtol");
+		}
+		return 0;
+	}
+
+	*zid = tzid;
 	return 1;
 }
 
