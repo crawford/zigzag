@@ -13,11 +13,11 @@ Fields seperated by spaces (three fields maximum).
 ###Commands###
 
 <pre>
-+---------+------------+---------------------------------------------------------------+
-| Command | Argument   | Description                                                   |
-+---------+------------+---------------------------------------------------------------+
-| sub     | channel id | Subscribes the client to messages from the specified channel  |
-| send    | zigbee id  | Sends a message (contents of payload) to the specified zigbee |
-+---------+------------+---------------------------------------------------------------+
++---------+------------+--------------------------------------------------------------+
+| Command | Argument  | Description                                                   |
++---------+------------+--------------------------------------------------------------+
+| sub     | zigbee id | Subscribes the client to messages from the specified zigbee   |
+| send    | zigbee id | Sends a message (contents of payload) to the specified zigbee |
++---------+-----------+---------------------------------------------------------------+
 </pre>
 
