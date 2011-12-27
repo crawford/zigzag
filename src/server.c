@@ -8,9 +8,14 @@
 #include <signal.h>
 #include <poll.h>
 #include <errno.h>
+#include <xbapi.h>
+#include <termios.h>
+#include <talloc.h>
 #include "node.h"
 #include "connection.h"
 #include "channel.h"
+
+#define DEBUG
 
 static const int MAX_PENDING = 5;
 static const int READ_BUF_LEN = 100;
@@ -22,23 +27,32 @@ static const char *MESSAGE_SEND = "send";
 
 void handle_sigterm();
 int setup_listening_socket(uint32_t, uint16_t);
+int setup_serial_connection(char *device);
 int accept_connection(int, node_root *);
 int append_to_fds(struct pollfd **, nfds_t *, int);
 int rebuild_fds(struct pollfd **, nfds_t *, node_root *);
 void process_client_message(node_root *, node *, char *);
 node *find_client_by_fd(node_root *, int);
-node *find_channel_by_id(node_root *, int);
+node *find_channel_by_id(node_root *, uint64_t);
 int convert_zid(char *, uint64_t *);
 void destroy_node_by_fd(node_root *, int);
 void disconnect(node_root *, node_root *, int);
+void exit_with_cleanup(int code, int fd, ...);
+
+void handle_node_connected(xbapi_node_identification_t *node, void *user_data);
+void handle_transmit_completed(xbapi_tx_status_t *status, void *user_data);
+void handle_received_packet(xbapi_rx_packet_t *packet, void *user_data);
+void handle_modem_changed(xbapi_modem_status_e status, void *user_data);
+bool handle_operation_completed(xbapi_op_t *op, void *user_data);
+
 
 
 char running = 1;
 
 int main(int argc, char **argv) {
-	int h_sock;
-	int h_zigbee;
-	int h_config;
+	int h_sock = -1;
+	int h_zigbee = -1;
+	int h_config = -1;
 	char *configName = NULL;
 
 	uint16_t listenPort;
@@ -50,25 +64,35 @@ int main(int argc, char **argv) {
 	node_root *clients;
 	node_root *channels;
 
+	xbapi_op_set_t *op_set = xbapi_init_op_set();
+	xbapi_conn_t *conn = NULL;
+	xbapi_callbacks_t callbacks = {
+		.node_connected = &handle_node_connected,
+		.transmit_completed = &handle_transmit_completed,
+		.received_packet = &handle_received_packet,
+		.modem_changed = &handle_modem_changed,
+		.operation_completed = &handle_operation_completed
+	};
+
 	if (signal(SIGINT, handle_sigterm) == SIG_ERR) {
 		perror("signal()");
-		exit(-1);
+		exit_with_cleanup(-1, 0);
 	}
 	if (signal(SIGTERM, handle_sigterm) == SIG_ERR) {
 		perror("signal()");
-		exit(-1);
+		exit_with_cleanup(-1, 0);
 	}
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s config_file\n", argv[0]);
-		exit(-1);
+		exit_with_cleanup(-1, 0);
 	}
 
 	// Create the list of client connections
 	clients = malloc(sizeof(node_root));
 	if (clients == NULL) {
 		perror("malloc()");
-		exit(-1);
+		exit_with_cleanup(-1, 0);
 	}
 	memset(clients, 0, sizeof(node_root));
 
@@ -76,7 +100,7 @@ int main(int argc, char **argv) {
 	channels = malloc(sizeof(node_root));
 	if (channels == NULL) {
 		perror("malloc()");
-		exit(-1);
+		exit_with_cleanup(-1, 0);
 	}
 	memset(channels, 0, sizeof(node_root));
 
@@ -87,33 +111,18 @@ int main(int argc, char **argv) {
 
 	if ((h_config = open(configName, O_RDONLY)) < 0) {
 		perror("open()");
-		exit(-1);
+		exit_with_cleanup(-1, 0);
 	}
 
 	h_sock = setup_listening_socket(listenAddr, listenPort);
-
-	// THIS IS TEST CODE BECAUSE I DON'T HAVE A DEVICE
-	//#############
-	struct sockaddr_in serverAddr;
-	if ((h_zigbee = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
-		perror("socket()");
-		exit(-1);
-	}
-	memset(&serverAddr, 0, sizeof(serverAddr));
-	serverAddr.sin_family = AF_INET;
-	serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
-	serverAddr.sin_port = htons(9000);
-
-	if (connect(h_zigbee, (struct sockaddr *) &serverAddr, sizeof(serverAddr)) < 0) {
-		perror("connect()");
-		exit(-1);
-	}
-	//#############
+	h_zigbee = setup_serial_connection(argv[1]);
+	if (h_sock < 0 || h_zigbee < 0) exit_with_cleanup(-1, h_config, h_sock, h_zigbee);
+	conn = xbapi_init_conn(h_zigbee);
 
 	fds = malloc(2 * sizeof(struct pollfd));
 	if (fds == NULL) {
 		perror("malloc()");
-		exit(-1);
+		exit_with_cleanup(-1, h_config, h_sock, h_zigbee);
 	}
 	nfds = 2;
 
@@ -154,37 +163,9 @@ int main(int argc, char **argv) {
 		// Check the second file descriptor (the zigbee pipe) for readable
 		if (fd->revents) {
 			if (fd->revents & POLLIN) {
-				char buf[READ_BUF_LEN];
-				int result = read(fd->fd, &buf, READ_BUF_LEN - 1);
-
-				if (result == -1) {
-					perror("read()");
-				} else if (result == 0) {
-					printf("Zigbee pipe is broken\n");
-				} else {
-					// Check to make sure that the message has:
-					//  a 2-byte channel id
-					//  a message delimiter
-					//  at least a 1-byte message
-					if (buf[2] != MESSAGE_DELIMITER_C || buf[result - 1] != MESSAGE_TERMINATOR || result < 5) {
-						printf("Malformed message received from zigbee\n");
-					} else {
-						buf[result - 1] = '\0';
-						printf("Read from zigbee (%s)\n", buf);
-
-						// Channel IDs (2 bytes) use network endian-ness
-						short channel_id = ntohs(*((short *)buf));
-						char *message = buf + 3;
-
-						node *channel_node = find_channel_by_id(channels, channel_id);
-						if (channel_node != NULL) {
-							node *client = ((channel *)channel_node->data)->subscribers->head;
-							while (client != NULL) {
-								send(((connection *)client->data)->h_socket, message, result - 3, 0);
-								client = client->next;
-							}
-						}
-					}
+				xbapi_rc_t rc = xbapi_process_data(conn, op_set, &callbacks, channels);
+				if (xbapi_errno(rc) != XBAPI_ERR_NOERR) {
+					fprintf(stderr, "xbapi_process_data(): %s\n", xbapi_strerror(rc));
 				}
 			}
 			result--;
@@ -245,7 +226,7 @@ int accept_connection(int h_sock, node_root *clients) {
 
 	if ((h_client = accept(h_sock, (struct sockaddr *) &clientAddr, &clientAddrLen)) < 0) {
 		perror("accept()");
-		exit(-1);
+		return -1;
 	}
 
 	node *node = create_node(clients);
@@ -318,7 +299,7 @@ int setup_listening_socket(uint32_t listenAddr, uint16_t listenPort) {
 	// Create the listening socket for the server
 	if ((h_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
 		perror("socket()");
-		exit(-1);
+		return -1;
 	}
 	memset(&serverAddr, 0, sizeof(serverAddr));
 	serverAddr.sin_family = AF_INET;
@@ -328,21 +309,50 @@ int setup_listening_socket(uint32_t listenAddr, uint16_t listenPort) {
 	// Bind to the listening address
 	if (bind(h_sock, (struct sockaddr *) &serverAddr, sizeof(serverAddr)) < 0) {
 		perror("bind()");
-		exit(-1);
+		return -1;
 	}
 
 	// Set the listending socket to be non-blocking
 	if (fcntl(h_sock, F_SETFL, O_NONBLOCK)) {
 		perror("fcntl()");
-		exit(-1);
+		return -1;
 	}
 
 	if (listen(h_sock, MAX_PENDING) < 0) {
 		perror("listen()");
-		exit(-1);
+		return -1;
 	}
 
 	return h_sock;
+}
+
+int setup_serial_connection(char *device) {
+	int h_serial = open(device, O_RDWR | O_NOCTTY | O_NDELAY);
+	if (h_serial == -1) {
+		perror("open()");
+		return -1;
+	}
+	//if (fcntl(h_serial, F_SETFL, FNDELAY) == -1) {
+	//	perror("fcntl()");
+	//}
+
+	struct termios tio;
+	tio.c_cflag = B9600 | CS8 | CSTOPB | CLOCAL | CREAD;
+	tio.c_iflag = IGNPAR;
+	tio.c_oflag = 0;
+	tio.c_lflag = 0;
+	tio.c_cc[VMIN] = 1;
+	tio.c_cc[VTIME] = 0;
+	if (tcflush(h_serial, TCIFLUSH) < 0) {
+		perror("tcflush()");
+		return -1;
+	}
+	if (tcsetattr(h_serial, TCSANOW, &tio) < 0) {
+		perror("tcsetattr()");
+		return -1;
+	}
+
+	return h_serial;
 }
 
 void handle_sigterm(int sig) {
@@ -360,7 +370,7 @@ void process_client_message(node_root *channels, node *client, char *message) {
 		uint64_t zid;
 		if (convert_zid(argument, &zid)) {
 			if (payload != NULL) {
-				printf("Sending message (%s) to zigbee (0x%lX)\n", payload, (long unsigned int)zid);
+				printf("Sending message (%s) to zigbee (0x%llX)\n", payload, zid);
 			} else {
 				printf("No payload specified\n");
 			}
@@ -368,12 +378,12 @@ void process_client_message(node_root *channels, node *client, char *message) {
 			printf("Invalid ZID (%s)\n", argument);
 		}
 	} else if (command != NULL && strcmp(command, MESSAGE_SUB) == 0) {
-		int channel_id;
+		uint64_t channel_id;
 		char *remaining;
 		errno = 0;
 
 		if (argument != NULL) {
-			channel_id = (int)strtol(argument, &remaining, 10);
+			channel_id = strtol(argument, &remaining, 10);
 		}
 		if (argument == NULL || *remaining != '\0' || errno) {
 			printf("Invalid channel number\n");
@@ -384,33 +394,33 @@ void process_client_message(node_root *channels, node *client, char *message) {
 			node *channel_node = find_channel_by_id(channels, channel_id);
 			if (channel_node == NULL) {
 				// Couldn't find the specified channel, so create it
-				channel *channel = create_channel(channel_id);
+				channel_t *channel = create_channel(channel_id);
 				if (channel == NULL) {
-					printf("Couldn't create channel (%d)\n", channel_id);
+					printf("Couldn't create channel (%lld)\n", channel_id);
 					return;
 				}
 				channel_node = create_node(channels);
 				if (channel_node == NULL) {
-					printf("Couldn't create channel (%d)\n", channel_id);
+					printf("Couldn't create channel (%lld)\n", channel_id);
 					return;
 				}
 				channel_node->data = channel;
-				printf("Created channel (%d)\n", channel_id);
+				printf("Created channel (%lld)\n", channel_id);
 			} else {
 				// Check to make sure that the client hasn't
 				// already subscribed to this channel
-				destroy_node_by_fd(((channel *)channel_node->data)->subscribers, ((connection *)client->data)->h_socket);
+				destroy_node_by_fd(((channel_t *)channel_node->data)->subscribers, ((connection *)client->data)->h_socket);
 			}
 
-			node *subscriber_node = create_node(((channel *)channel_node->data)->subscribers);
+			node *subscriber_node = create_node(((channel_t *)channel_node->data)->subscribers);
 			if (subscriber_node == NULL) {
 				printf("Couldn't add subscriber to channel\n");
 				return;
 			}
-			printf("Subscribed %x to channel %d\n", client, channel_id);
+			printf("Subscribed %p to channel %lld\n", client, channel_id);
 			subscriber_node->data = client->data;
 
-			printf("%d clients subscribed to channel %d\n", ((channel *)channel_node->data)->subscribers->count, channel_id);
+			printf("%d clients subscribed to channel %lld\n", ((channel_t *)channel_node->data)->subscribers->count, channel_id);
 		}
 	} else {
 		printf("Unrecognized command '%s'\n", command);
@@ -430,11 +440,11 @@ node *find_client_by_fd(node_root *root, int fd) {
 	return NULL;
 }
 
-node *find_channel_by_id(node_root *root, int id) {
+node *find_channel_by_id(node_root *root, uint64_t id) {
 	node *node = root->head;
 
 	while (node != NULL) {
-		if (((channel *)node->data)->id == id) {
+		if (((channel_t *)node->data)->id == id) {
 			return node;
 		}
 		node = node->next;
@@ -487,16 +497,259 @@ void disconnect(node_root *clients, node_root *channels, int fd) {
 		node *cur = next;
 		next = cur->next;
 
-		destroy_node_by_fd(((channel *)cur->data)->subscribers, fd);
+		destroy_node_by_fd(((channel_t *)cur->data)->subscribers, fd);
 
 		// Remove the channel if it is empty
-		if (((channel *)cur->data)->subscribers->count == 0) {
-			printf("Removing empty channel (%d)\n", ((channel *)cur->data)->id);
+		if (((channel_t *)cur->data)->subscribers->count == 0) {
+			printf("Removing empty channel (%lld)\n", ((channel_t *)cur->data)->id);
 			destroy_node(channels, cur);
 		}
 	}
 
 
 	close(fd);
+}
+
+void exit_with_cleanup(int code, int fd, ...) {
+	int *fds = &fd;
+	while (*fds) {
+		if (*fds > 0) close(*fds);
+		fds++;
+	}
+
+	exit(code);
+}
+
+
+void handle_node_connected(xbapi_node_identification_t *node, void *user_data) {
+	(void)user_data;
+#ifdef DEBUG
+	printf("Source Address: %llX\n", node->source_address);
+	printf("Source Network Address: %X\n", node->source_network_address);
+	switch (node->receive_options) {
+		case XBAPI_RX_OPT_ACKNOWLEDGE:
+			printf("Receive Options: Acknowledge\n");
+			break;
+		case XBAPI_RX_OPT_BROADCAST:
+			printf("Receive Options: Broadcast\n");
+			break;
+		case XBAPI_RX_OPT_INVALID:
+			printf("Receive Options: Invalid\n");
+	}
+	printf("Remote Address: %llX\n", node->remote_address);
+	printf("Remote Network Address: %X\n", node->remote_network_address);
+	printf("Node Identifier: %s\n", node->node_identifier);
+	printf("Parent Network Address: %X\n", node->parent_network_address);
+	switch (node->device_type) {
+		case XBAPI_DEVICE_TYPE_COORDINATOR:
+			printf("Device Type: Coordinator\n");
+			break;
+		case XBAPI_DEVICE_TYPE_ROUTER:
+			printf("Device Type: Router\n");
+			break;
+		case XBAPI_DEVICE_TYPE_END_DEVICE:
+			printf("Device Type: End Device\n");
+			break;
+		case XBAPI_DEVICE_TYPE_INVALID:
+			printf("Device Type: Invalid\n");
+	}
+	switch (node->source_event) {
+		case XBAPI_SOURCE_EVENT_PUSHBUTTON:
+			printf("Source Event: Pushbutton\n");
+			break;
+		case XBAPI_SOURCE_EVENT_JOINED:
+			printf("Source Event: Joined\n");
+			break;
+		case XBAPI_SOURCE_EVENT_POWER_CYCLE:
+			printf("Source Event: Power Cycle\n");
+			break;
+		case XBAPI_SOURCE_EVENT_INVALID:
+			printf("Source Event: Invalid\n");
+	}
+	printf("Profile ID: %X\n", node->profile_id);
+	printf("Manufacturer ID: %X\n", node->manufacturer_id);
+	printf("\n");
+#endif
+}
+
+void handle_transmit_completed(xbapi_tx_status_t *status, void *user_data) {
+	(void)user_data;
+#ifdef DEBUG
+	printf("Delivery Network Address: %X\n", status->delivery_network_address);
+	printf("Retry Count: %d\n", status->retry_count);
+	switch (status->delivery_status) {
+		case XBAPI_DELIVERY_STATUS_SUCCESS:
+			printf("Delivery Status: Success\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_MAC_ACK_FAIL:
+			printf("Delivery Status: MAC ACK Fail\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_CCA_FAIL:
+			printf("Delivery Status: CCA Fail\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_INVALID_DEST:
+			printf("Delivery Status: Invalid Destination\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_NET_ACK_FAIL:
+			printf("Delivery Status: Network ACK Fail\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_NOT_JOINED:
+			printf("Delivery Status: Not Joined\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_SELF_ADDRESSED:
+			printf("Delivery Status: Self Addressed\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_ADDRESS_NOT_FOUND:
+			printf("Delivery Status: Address Not Found\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_ROUTE_NOT_FOUND:
+			printf("Delivery Status: Route Not Found\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_NO_RELAY:
+			printf("Delivery Status: No Relay\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_INVALID_BIND:
+			printf("Delivery Status: Invalid Bind Index\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_RESOURCE_1:
+			printf("Delivery Status: Not Enough Resources\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_BROADCAST_APS:
+			printf("Delivery Status: Broadcast APS\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_UNICAST_APS:
+			printf("Delivery Status: UNICAST APS\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_RESOURCE_2:
+			printf("Delivery Status: Not Enough Resources\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_TOO_LARGE:
+			printf("Delivery Status: Too Large\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_INDIRECT:
+			printf("Delivery Status: Indirect\n");
+			break;
+		case XBAPI_DELIVERY_STATUS_INVALID:
+			printf("Delivery Status: Invalid\n");
+			break;
+	}
+	switch(status->discovery_status) {
+		case XBAPI_DISCOVERY_STATUS_NONE:
+			printf("Discovery Status: No Overhead\n");
+			break;
+		case XBAPI_DISCOVERY_STATUS_ADDRESS:
+			printf("Discovery Status: Address Discovery\n");
+			break;
+		case XBAPI_DISCOVERY_STATUS_ROUTE:
+			printf("Discovery Status: Route Discovery\n");
+			break;
+		case XBAPI_DISCOVERY_STATUS_BOTH:
+			printf("Discovery Status: Address and Route Discovery\n");
+			break;
+		case XBAPI_DISCOVERY_STATUS_TIMEOUT:
+			printf("Discovery Status: Timeout Discovery\n");
+			break;
+		case XBAPI_DISCOVERY_STATUS_INVALID:
+			printf("Discovery Status: Invalid\n");
+			break;
+	}
+	printf("\n");
+#endif
+}
+
+void handle_received_packet(xbapi_rx_packet_t *packet, void *user_data) {
+#ifdef DEBUG
+	printf("Source Address: %llX\n", packet->source_address);
+	printf("Source Network Address: %X\n", packet->source_network_address);
+	switch(packet->options) {
+	case XBAPI_RX_OPTIONS_ACK:
+		printf("Receive Options: Acknowledged\n");
+		break;
+	case XBAPI_RX_OPTIONS_BROADCAST:
+		printf("Receive Options: Broadcasted\n");
+		break;
+	case XBAPI_RX_OPTIONS_ENCRYPTED:
+		printf("Receive Options: Encrypted\n");
+		break;
+	case XBAPI_RX_OPTIONS_END_DEVICE:
+		printf("Receive Options: End Device\n");
+		break;
+	case XBAPI_RX_OPTIONS_INVALID:
+		printf("Receive Options: Invalid\n");
+		break;
+	}
+	printf("Data: ");
+	for (size_t i = 0; i < talloc_array_length(packet->data); i++)
+		printf("0x%02X ", packet->data[i]);
+	printf("\n\n");
+#endif
+
+	node_root *channels = (node_root *)user_data;
+	node *channel_node = find_channel_by_id(channels, packet->source_address);
+	if (channel_node != NULL) {
+		for (node *client = ((channel_t *)channel_node->data)->subscribers->head; client != NULL; client = client->next) {
+			size_t data_len = talloc_array_length(packet->data);
+			uint8_t *data = packet->data;
+			ssize_t ret;
+			do {
+				ret = send(((connection *)client->data)->h_socket, data, data_len, 0);
+				if (ret < 0) {
+					perror("send()");
+					break;
+				} else if ((size_t)ret < data_len) {
+					data_len -= ret;
+					data += ret;
+				}
+			} while ((size_t)ret < data_len);
+		}
+	}
+}
+
+void handle_modem_changed(xbapi_modem_status_e status, void *user_data) {
+	(void)user_data;
+#ifdef DEBUG
+	switch (status) {
+		case XBAPI_MODEM_HARDWARE_RESET:
+			printf("Modem Changed: Hardware Reset\n");
+			break;
+		case XBAPI_MODEM_WDT_RESET:
+			printf("Modem Changed: WDT Reset\n");
+			break;
+		case XBAPI_MODEM_JOINED_NETWORK:
+			printf("Modem Changed: Joined Network\n");
+			break;
+		case XBAPI_MODEM_DISASSOCIATED:
+			printf("Modem Changed: Disassociated\n");
+			break;
+		case XBAPI_MODEM_COORDINATOR_STARTED:
+			printf("Modem Changed: Coordinator Started\n");
+			break;
+		case XBAPI_MODEM_SECURITY_KEY_UPDATED:
+			printf("Modem Changed: Key Updated\n");
+			break;
+		case XBAPI_MODEM_OVERVOLTAGE:
+			printf("Modem Changed: Overvoltage\n");
+			break;
+		case XBAPI_MODEM_CONFIG_CHANGED_WHILE_JOINING:
+			printf("Modem Changed: Config Changed While Joining Networks\n");
+			break;
+		case XBAPI_MODEM_STACK_ERROR:
+			printf("Modem Changed: Stack Error\n");
+			break;
+		case XBAPI_MODEM_STATUS_UNKNOWN:
+			printf("Modem Changed: Unknown\n");
+			break;
+	}
+	printf("\n");
+#endif
+}
+
+bool handle_operation_completed(xbapi_op_t *op, void *user_data) {
+	(void)user_data;
+	(void)op;
+#ifdef DEBUG
+	printf("Operation completed\n\n");
+#endif
+	return false;
 }
 
