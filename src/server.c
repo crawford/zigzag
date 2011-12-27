@@ -37,7 +37,7 @@ node *find_channel_by_id(node_root *, uint64_t);
 int convert_zid(char *, uint64_t *);
 void destroy_node_by_fd(node_root *, int);
 void disconnect(node_root *, node_root *, int);
-void exit_with_cleanup(int code, ...);
+void exit_with_cleanup(int code, int fd, ...);
 
 void handle_node_connected(xbapi_node_identification_t *node, void *user_data);
 void handle_transmit_completed(xbapi_tx_status_t *status, void *user_data);
@@ -76,23 +76,23 @@ int main(int argc, char **argv) {
 
 	if (signal(SIGINT, handle_sigterm) == SIG_ERR) {
 		perror("signal()");
-		exit_with_cleanup(-1);
+		exit_with_cleanup(-1, 0);
 	}
 	if (signal(SIGTERM, handle_sigterm) == SIG_ERR) {
 		perror("signal()");
-		exit_with_cleanup(-1);
+		exit_with_cleanup(-1, 0);
 	}
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s config_file\n", argv[0]);
-		exit_with_cleanup(-1);
+		exit_with_cleanup(-1, 0);
 	}
 
 	// Create the list of client connections
 	clients = malloc(sizeof(node_root));
 	if (clients == NULL) {
 		perror("malloc()");
-		exit_with_cleanup(-1);
+		exit_with_cleanup(-1, 0);
 	}
 	memset(clients, 0, sizeof(node_root));
 
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
 	channels = malloc(sizeof(node_root));
 	if (channels == NULL) {
 		perror("malloc()");
-		exit_with_cleanup(-1);
+		exit_with_cleanup(-1, 0);
 	}
 	memset(channels, 0, sizeof(node_root));
 
@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
 
 	if ((h_config = open(configName, O_RDONLY)) < 0) {
 		perror("open()");
-		exit_with_cleanup(-1);
+		exit_with_cleanup(-1, 0);
 	}
 
 	h_sock = setup_listening_socket(listenAddr, listenPort);
@@ -394,33 +394,33 @@ void process_client_message(node_root *channels, node *client, char *message) {
 			node *channel_node = find_channel_by_id(channels, channel_id);
 			if (channel_node == NULL) {
 				// Couldn't find the specified channel, so create it
-				channel *channel = create_channel(channel_id);
+				channel_t *channel = create_channel(channel_id);
 				if (channel == NULL) {
-					printf("Couldn't create channel (%d)\n", channel_id);
+					printf("Couldn't create channel (%lld)\n", channel_id);
 					return;
 				}
 				channel_node = create_node(channels);
 				if (channel_node == NULL) {
-					printf("Couldn't create channel (%d)\n", channel_id);
+					printf("Couldn't create channel (%lld)\n", channel_id);
 					return;
 				}
 				channel_node->data = channel;
-				printf("Created channel (%d)\n", channel_id);
+				printf("Created channel (%lld)\n", channel_id);
 			} else {
 				// Check to make sure that the client hasn't
 				// already subscribed to this channel
-				destroy_node_by_fd(((channel *)channel_node->data)->subscribers, ((connection *)client->data)->h_socket);
+				destroy_node_by_fd(((channel_t *)channel_node->data)->subscribers, ((connection *)client->data)->h_socket);
 			}
 
-			node *subscriber_node = create_node(((channel *)channel_node->data)->subscribers);
+			node *subscriber_node = create_node(((channel_t *)channel_node->data)->subscribers);
 			if (subscriber_node == NULL) {
 				printf("Couldn't add subscriber to channel\n");
 				return;
 			}
-			printf("Subscribed %p to channel %d\n", client, channel_id);
+			printf("Subscribed %p to channel %lld\n", client, channel_id);
 			subscriber_node->data = client->data;
 
-			printf("%d clients subscribed to channel %d\n", ((channel *)channel_node->data)->subscribers->count, channel_id);
+			printf("%d clients subscribed to channel %lld\n", ((channel_t *)channel_node->data)->subscribers->count, channel_id);
 		}
 	} else {
 		printf("Unrecognized command '%s'\n", command);
@@ -444,7 +444,7 @@ node *find_channel_by_id(node_root *root, uint64_t id) {
 	node *node = root->head;
 
 	while (node != NULL) {
-		if (((channel *)node->data)->id == id) {
+		if (((channel_t *)node->data)->id == id) {
 			return node;
 		}
 		node = node->next;
@@ -497,11 +497,11 @@ void disconnect(node_root *clients, node_root *channels, int fd) {
 		node *cur = next;
 		next = cur->next;
 
-		destroy_node_by_fd(((channel *)cur->data)->subscribers, fd);
+		destroy_node_by_fd(((channel_t *)cur->data)->subscribers, fd);
 
 		// Remove the channel if it is empty
-		if (((channel *)cur->data)->subscribers->count == 0) {
-			printf("Removing empty channel (%d)\n", ((channel *)cur->data)->id);
+		if (((channel_t *)cur->data)->subscribers->count == 0) {
+			printf("Removing empty channel (%lld)\n", ((channel_t *)cur->data)->id);
 			destroy_node(channels, cur);
 		}
 	}
@@ -510,8 +510,8 @@ void disconnect(node_root *clients, node_root *channels, int fd) {
 	close(fd);
 }
 
-void exit_with_cleanup(int code, ...) {
-	int *fds = &code + 1;
+void exit_with_cleanup(int code, int fd, ...) {
+	int *fds = &fd;
 	while (*fds) {
 		if (*fds > 0) close(*fds);
 		fds++;
@@ -687,19 +687,20 @@ void handle_received_packet(xbapi_rx_packet_t *packet, void *user_data) {
 	node_root *channels = (node_root *)user_data;
 	node *channel_node = find_channel_by_id(channels, packet->source_address);
 	if (channel_node != NULL) {
-		for (node *client = ((channel *)channel_node->data)->subscribers->head; client != NULL, client = client->next) {
+		for (node *client = ((channel_t *)channel_node->data)->subscribers->head; client != NULL; client = client->next) {
 			size_t data_len = talloc_array_length(packet->data);
 			uint8_t *data = packet->data;
+			ssize_t ret;
 			do {
-				ssize_t ret = send(((connection *)client->data)->h_socket, data, data_len, 0);
+				ret = send(((connection *)client->data)->h_socket, data, data_len, 0);
 				if (ret < 0) {
 					perror("send()");
 					break;
-				} else if (ret < data_len) {
+				} else if ((size_t)ret < data_len) {
 					data_len -= ret;
 					data += ret;
 				}
-			} while (ret < data_len);
+			} while ((size_t)ret < data_len);
 		}
 	}
 }
