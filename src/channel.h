@@ -6,7 +6,7 @@
 
 typedef struct {
 	uint64_t id;
-	node_root *subscribers;
+	root_node_t *subscribers;
 } channel_t;
 
 channel_t *create_channel(int id);

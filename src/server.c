@@ -28,15 +28,15 @@ static const char *MESSAGE_SEND = "send";
 void handle_sigterm();
 int setup_listening_socket(uint32_t, uint16_t);
 int setup_serial_connection(char *device);
-int accept_connection(int, node_root *);
+int accept_connection(int, root_node_t *);
 int append_to_fds(struct pollfd **, nfds_t *, int);
-int rebuild_fds(struct pollfd **, nfds_t *, node_root *);
-void process_client_message(node_root *, node *, char *);
-node *find_client_by_fd(node_root *, int);
-node *find_channel_by_id(node_root *, uint64_t);
+int rebuild_fds(struct pollfd **, nfds_t *, root_node_t *);
+void process_client_message(root_node_t *, node_t *, char *);
+node_t *find_client_by_fd(root_node_t *, int);
+node_t *find_channel_by_id(root_node_t *, uint64_t);
 int convert_zid(char *, uint64_t *);
-void destroy_node_by_fd(node_root *, int);
-void disconnect(node_root *, node_root *, int);
+void destroy_node_by_fd(root_node_t *, int);
+void disconnect(root_node_t *, root_node_t *, int);
 void exit_with_cleanup(int code, int fd, ...);
 
 void handle_node_connected(xbapi_node_identification_t *node, void *user_data);
@@ -61,8 +61,8 @@ int main(int argc, char **argv) {
 	struct pollfd *fds = NULL;
 	nfds_t nfds = 0;
 
-	node_root *clients;
-	node_root *channels;
+	root_node_t *clients;
+	root_node_t *channels;
 
 	xbapi_op_set_t *op_set = xbapi_init_op_set();
 	xbapi_conn_t *conn = NULL;
@@ -89,20 +89,20 @@ int main(int argc, char **argv) {
 	}
 
 	// Create the list of client connections
-	clients = malloc(sizeof(node_root));
+	clients = malloc(sizeof(root_node_t));
 	if (clients == NULL) {
 		perror("malloc()");
 		exit_with_cleanup(-1, 0);
 	}
-	memset(clients, 0, sizeof(node_root));
+	memset(clients, 0, sizeof(root_node_t));
 
 	// Create the list of channels
-	channels = malloc(sizeof(node_root));
+	channels = malloc(sizeof(root_node_t));
 	if (channels == NULL) {
 		perror("malloc()");
 		exit_with_cleanup(-1, 0);
 	}
-	memset(channels, 0, sizeof(node_root));
+	memset(channels, 0, sizeof(root_node_t));
 
 	// Open and parse the config file
 	configName = argv[1];
@@ -219,7 +219,7 @@ int main(int argc, char **argv) {
 	return 0;
 }
 
-int accept_connection(int h_sock, node_root *clients) {
+int accept_connection(int h_sock, root_node_t *clients) {
 	struct sockaddr_in clientAddr;
 	socklen_t clientAddrLen = sizeof(clientAddr);
 	int h_client;
@@ -229,7 +229,7 @@ int accept_connection(int h_sock, node_root *clients) {
 		return -1;
 	}
 
-	node *node = create_node(clients);
+	node_t *node = create_node(clients);
 	if (node == NULL) {
 		perror("malloc()");
 		return -1;
@@ -267,7 +267,7 @@ int append_to_fds(struct pollfd **fds, nfds_t *size, int fd) {
 	return 0;
 }
 
-int rebuild_fds(struct pollfd **fds, nfds_t *size, node_root *clients) {
+int rebuild_fds(struct pollfd **fds, nfds_t *size, root_node_t *clients) {
 	struct pollfd *new = realloc(*fds, (clients->count + 2) * sizeof(struct pollfd));
 	if (new == NULL) {
 		perror("malloc()");
@@ -279,7 +279,7 @@ int rebuild_fds(struct pollfd **fds, nfds_t *size, node_root *clients) {
 
 	// Iterate through all of the connected nodes and create file descriptor
 	// entries for them.
-	node *node = clients->head;
+	node_t *node = clients->head;
 	struct pollfd *fd = *fds + 2;
 	while (node != NULL) {
 		fd->fd = ((connection *)node->data)->h_socket;
@@ -361,7 +361,7 @@ void handle_sigterm(int sig) {
 	printf("Terminating daemon\n");
 }
 
-void process_client_message(node_root *channels, node *client, char *message) {
+void process_client_message(root_node_t *channels, node_t *client, char *message) {
 	char *command = strtok(message, MESSAGE_DELIMITER_S);
 	char *argument = strtok(NULL, MESSAGE_DELIMITER_S);
 	char *payload = strtok(NULL, MESSAGE_DELIMITER_S);
@@ -391,7 +391,7 @@ void process_client_message(node_root *channels, node *client, char *message) {
 				perror("strtol");
 			}
 		} else {
-			node *channel_node = find_channel_by_id(channels, channel_id);
+			node_t *channel_node = find_channel_by_id(channels, channel_id);
 			if (channel_node == NULL) {
 				// Couldn't find the specified channel, so create it
 				channel_t *channel = create_channel(channel_id);
@@ -412,7 +412,7 @@ void process_client_message(node_root *channels, node *client, char *message) {
 				destroy_node_by_fd(((channel_t *)channel_node->data)->subscribers, ((connection *)client->data)->h_socket);
 			}
 
-			node *subscriber_node = create_node(((channel_t *)channel_node->data)->subscribers);
+			node_t *subscriber_node = create_node(((channel_t *)channel_node->data)->subscribers);
 			if (subscriber_node == NULL) {
 				printf("Couldn't add subscriber to channel\n");
 				return;
@@ -427,8 +427,8 @@ void process_client_message(node_root *channels, node *client, char *message) {
 	}
 }
 
-node *find_client_by_fd(node_root *root, int fd) {
-	node *node = root->head;
+node_t *find_client_by_fd(root_node_t *root, int fd) {
+	node_t *node = root->head;
 
 	while (node != NULL) {
 		if (((connection *)node->data)->h_socket == fd) {
@@ -440,8 +440,8 @@ node *find_client_by_fd(node_root *root, int fd) {
 	return NULL;
 }
 
-node *find_channel_by_id(node_root *root, uint64_t id) {
-	node *node = root->head;
+node_t *find_channel_by_id(root_node_t *root, uint64_t id) {
+	node_t *node = root->head;
 
 	while (node != NULL) {
 		if (((channel_t *)node->data)->id == id) {
@@ -473,10 +473,10 @@ int convert_zid(char *strzid, uint64_t *zid) {
 	return 1;
 }
 
-void destroy_node_by_fd(node_root *root, int fd) {
-	node *next = root->head;
+void destroy_node_by_fd(root_node_t *root, int fd) {
+	node_t *next = root->head;
 	while (next != NULL) {
-		node *cur = next;
+		node_t *cur = next;
 		next = cur->next;
 
 		if (((connection *)cur->data)->h_socket == fd) {
@@ -486,15 +486,15 @@ void destroy_node_by_fd(node_root *root, int fd) {
 	}
 }
 
-void disconnect(node_root *clients, node_root *channels, int fd) {
+void disconnect(root_node_t *clients, root_node_t *channels, int fd) {
 	printf("Disconnected\n");
 
 	destroy_node_by_fd(clients, fd);
 
 	// Remove the client from all of the channel subscriptions
-	node *next = channels->head;
+	node_t *next = channels->head;
 	while (next != NULL) {
-		node *cur = next;
+		node_t *cur = next;
 		next = cur->next;
 
 		destroy_node_by_fd(((channel_t *)cur->data)->subscribers, fd);
@@ -684,10 +684,10 @@ void handle_received_packet(xbapi_rx_packet_t *packet, void *user_data) {
 	printf("\n\n");
 #endif
 
-	node_root *channels = (node_root *)user_data;
-	node *channel_node = find_channel_by_id(channels, packet->source_address);
+	root_node_t *channels = (root_node_t *)user_data;
+	node_t *channel_node = find_channel_by_id(channels, packet->source_address);
 	if (channel_node != NULL) {
-		for (node *client = ((channel_t *)channel_node->data)->subscribers->head; client != NULL; client = client->next) {
+		for (node_t *client = ((channel_t *)channel_node->data)->subscribers->head; client != NULL; client = client->next) {
 			size_t data_len = talloc_array_length(packet->data);
 			uint8_t *data = packet->data;
 			ssize_t ret;

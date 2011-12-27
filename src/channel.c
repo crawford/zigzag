@@ -8,12 +8,12 @@ channel_t *create_channel(int id) {
 		return NULL;
 
 	channel->id = id;
-	channel->subscribers = malloc(sizeof(node_root));
+	channel->subscribers = malloc(sizeof(root_node_t));
 	if (channel->subscribers == NULL) {
 		free(channel);
 		return NULL;
 	}
-	memset(channel->subscribers, 0, sizeof(node_root));
+	memset(channel->subscribers, 0, sizeof(root_node_t));
 	return channel;
 }
 
