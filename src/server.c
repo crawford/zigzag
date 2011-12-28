@@ -24,6 +24,9 @@ static const char MESSAGE_DELIMITER_C = ' ';
 static const char MESSAGE_START = '$';
 static const char *MESSAGE_SUB = "sub";
 static const char *MESSAGE_SEND = "send";
+static const char *MESSAGE_RES = "res";
+static const char *MESSAGE_TRUE = "true";
+static const char *MESSAGE_FALSE = "false";
 
 void handle_sigterm();
 int setup_listening_socket(uint32_t, uint16_t);
@@ -38,7 +41,8 @@ bool convert_zid(char *, uint64_t *);
 bool convert_msglen(char *, unsigned int *);
 void destroy_node_by_fd(root_node_t *, int);
 void disconnect(root_node_t *, root_node_t *, int);
-void exit_with_cleanup(int code, int fd, ...);
+void exit_with_cleanup(int, int, ...);
+bool send_response(int, char *, char *);
 
 void handle_node_connected(xbapi_node_identification_t *node, void *user_data);
 void handle_transmit_completed(xbapi_tx_status_t *status, void *user_data);
@@ -373,12 +377,14 @@ bool process_client_message(root_node_t *channels, node_t *client, char *message
 
 	if (f_cmd == NULL || f_zid == NULL) {
 		printf("Malformed command\n");
+		send_response(((connection *)client->data)->h_socket, NULL, "malformed command");
 		return false;
 	}
 
 	uint64_t v_zid;
 	if (convert_zid(f_zid, &v_zid)) {
 		printf("Invalid ZID (%s)\n", f_zid);
+		send_response(((connection *)client->data)->h_socket, NULL, "invalid ZID");
 		return false;
 	}
 
@@ -389,6 +395,7 @@ bool process_client_message(root_node_t *channels, node_t *client, char *message
 
 		if (f_msgid == NULL || f_msglen == NULL || f_msg == NULL) {
 			printf("Malformed 'send' command\n");
+			send_response(((connection *)client->data)->h_socket, NULL, "malformed 'send' command");
 			return false;
 		}
 
@@ -397,6 +404,7 @@ bool process_client_message(root_node_t *channels, node_t *client, char *message
 
 		if (strlen(f_msg) != v_msglen && v_msglen > 0) {
 			printf("Message payload is too short\n");
+			send_response(((connection *)client->data)->h_socket, NULL, "message payload is too short");
 			return false;
 		}
 
@@ -409,11 +417,13 @@ bool process_client_message(root_node_t *channels, node_t *client, char *message
 			channel_t *channel = create_channel(v_zid);
 			if (channel == NULL) {
 				printf("Couldn't create channel (%lld)\n", v_zid);
+				send_response(((connection *)client->data)->h_socket, NULL, "internal error");
 				return false;
 			}
 			channel_node = create_node(channels);
 			if (channel_node == NULL) {
 				printf("Couldn't create channel (%lld)\n", v_zid);
+				send_response(((connection *)client->data)->h_socket, NULL, "internal error");
 				return false;
 			}
 			channel_node->data = channel;
@@ -427,15 +437,18 @@ bool process_client_message(root_node_t *channels, node_t *client, char *message
 		node_t *subscriber_node = create_node(((channel_t *)channel_node->data)->subscribers);
 		if (subscriber_node == NULL) {
 			printf("Couldn't add subscriber to channel\n");
+			send_response(((connection *)client->data)->h_socket, NULL, "internal error");
 			return false;
 		}
 		printf("Subscribed %p to channel %lld\n", client, v_zid);
 		subscriber_node->data = client->data;
 
 		printf("%d clients subscribed to channel %lld\n", ((channel_t *)channel_node->data)->subscribers->count, v_zid);
+		send_response(((connection *)client->data)->h_socket, NULL, NULL);
 		return true;
 	} else {
 		printf("Unrecognized command '%s'\n", f_cmd);
+		send_response(((connection *)client->data)->h_socket, NULL, "unrecognized command");
 		return false;
 	}
 }
@@ -550,6 +563,37 @@ void exit_with_cleanup(int code, int fd, ...) {
 	}
 
 	exit(code);
+}
+
+bool send_response(int fd, char *msgid, char *errorstr) {
+	const char *resstr = (errorstr == NULL) ? MESSAGE_TRUE : MESSAGE_FALSE;
+
+	size_t res_len = strlen(MESSAGE_RES);
+	size_t msgid_len = strlen(msgid);
+	size_t resstr_len = strlen(resstr);
+	size_t errorstr_len = strlen(errorstr);
+
+	size_t response_len = 5 + res_len + msgid_len + resstr_len + errorstr_len;
+	char *response = malloc(sizeof(char) * response_len);
+	if (response == NULL) return false;
+
+	response[0] = MESSAGE_START;
+	response[1] = MESSAGE_DELIMITER_C;
+	memcpy(response + 2, MESSAGE_RES, res_len);
+	response[2 + res_len] = MESSAGE_DELIMITER_C;
+	memcpy(response + 3 + res_len, msgid, msgid_len);
+	response[3 + res_len + msgid_len] = MESSAGE_DELIMITER_C;
+	memcpy(response + 4 + res_len + msgid_len, resstr, resstr_len);
+	response[4 + res_len + msgid_len + resstr_len] = MESSAGE_DELIMITER_C;
+	memcpy(response + 5 + res_len + msgid_len + resstr_len, errorstr, errorstr_len);
+
+	ssize_t res;
+	for (size_t pos = 0; pos < response_len; pos += res) {
+		res = send(fd, response + pos, response_len - pos, 0);
+		if (res < 0) return false;
+	}
+
+	return true;
 }
 
 
