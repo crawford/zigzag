@@ -21,7 +21,7 @@ static const int MAX_PENDING = 5;
 static const int READ_BUF_LEN = 100;
 static const char *MESSAGE_DELIMITER_S = " ";
 static const char MESSAGE_DELIMITER_C = ' ';
-static const char MESSAGE_TERMINATOR = '\n';
+static const char MESSAGE_START = '$';
 static const char *MESSAGE_SUB = "sub";
 static const char *MESSAGE_SEND = "send";
 
@@ -29,12 +29,13 @@ void handle_sigterm();
 int setup_listening_socket(uint32_t, uint16_t);
 int setup_serial_connection(char *device);
 int accept_connection(int, root_node_t *);
-int append_to_fds(struct pollfd **, nfds_t *, int);
-int rebuild_fds(struct pollfd **, nfds_t *, root_node_t *);
-void process_client_message(root_node_t *, node_t *, char *);
+bool append_to_fds(struct pollfd **, nfds_t *, int);
+bool rebuild_fds(struct pollfd **, nfds_t *, root_node_t *);
+bool process_client_message(root_node_t *, node_t *, char *, ssize_t);
 node_t *find_client_by_fd(root_node_t *, int);
 node_t *find_channel_by_id(root_node_t *, uint64_t);
-int convert_zid(char *, uint64_t *);
+bool convert_zid(char *, uint64_t *);
+bool convert_msglen(char *, unsigned int *);
 void destroy_node_by_fd(root_node_t *, int);
 void disconnect(root_node_t *, root_node_t *, int);
 void exit_with_cleanup(int code, int fd, ...);
@@ -148,7 +149,7 @@ int main(int argc, char **argv) {
 		if (fd->revents) {
 			if (fd->revents & POLLIN) {
 				int h_client = accept_connection(fd->fd, clients);
-				if (append_to_fds(&fds, &nfds, h_client) < 0) {
+				if (!append_to_fds(&fds, &nfds, h_client)) {
 					// We couldn't add the client to the list of file descriptors
 					// so send an error and disconnect
 					send(h_client, "Fuck\n", 5, 0);
@@ -187,7 +188,7 @@ int main(int argc, char **argv) {
 				}
 				if (fd->revents & POLLIN) {
 					char buf[READ_BUF_LEN];
-					int result = read(fd->fd, &buf, READ_BUF_LEN - 1);
+					ssize_t result = read(fd->fd, &buf, READ_BUF_LEN - 1);
 
 					if (result == -1) {
 						perror("read()");
@@ -200,9 +201,10 @@ int main(int argc, char **argv) {
 						continue;
 					}
 
-					if (buf[result - 1] == MESSAGE_TERMINATOR) {
-						buf[result - 1] = '\0';
-						process_client_message(channels, find_client_by_fd(clients, fd->fd), buf);
+					buf[result] = '\0';
+
+					if (!process_client_message(channels, find_client_by_fd(clients, fd->fd), buf, result)) {
+						printf("Received invalid message\n");
 					}
 				}
 			}
@@ -250,11 +252,11 @@ int accept_connection(int h_sock, root_node_t *clients) {
 	return h_client;
 }
 
-int append_to_fds(struct pollfd **fds, nfds_t *size, int fd) {
+bool append_to_fds(struct pollfd **fds, nfds_t *size, int fd) {
 	struct pollfd *new = realloc(*fds, sizeof(struct pollfd) * (*size + 1));
 	if (new == NULL) {
 		perror("malloc()");
-		return -1;
+		return false;
 	}
 
 	*fds = new;
@@ -264,14 +266,14 @@ int append_to_fds(struct pollfd **fds, nfds_t *size, int fd) {
 
 	(*size)++;
 
-	return 0;
+	return true;
 }
 
-int rebuild_fds(struct pollfd **fds, nfds_t *size, root_node_t *clients) {
+bool rebuild_fds(struct pollfd **fds, nfds_t *size, root_node_t *clients) {
 	struct pollfd *new = realloc(*fds, (clients->count + 2) * sizeof(struct pollfd));
 	if (new == NULL) {
 		perror("malloc()");
-		return -1;
+		return false;
 	}
 
 	*fds = new;
@@ -289,7 +291,7 @@ int rebuild_fds(struct pollfd **fds, nfds_t *size, root_node_t *clients) {
 		node = node->next;
 	}
 
-	return 0;
+	return true;
 }
 
 int setup_listening_socket(uint32_t listenAddr, uint16_t listenPort) {
@@ -361,69 +363,80 @@ void handle_sigterm(int sig) {
 	printf("Terminating daemon\n");
 }
 
-void process_client_message(root_node_t *channels, node_t *client, char *message) {
-	char *command = strtok(message, MESSAGE_DELIMITER_S);
-	char *argument = strtok(NULL, MESSAGE_DELIMITER_S);
-	char *payload = strtok(NULL, MESSAGE_DELIMITER_S);
+bool process_client_message(root_node_t *channels, node_t *client, char *message, ssize_t msg_len) {
+	if (message[0] != MESSAGE_START) return false;
+	message++;
+	msg_len--;
 
-	if (command != NULL && strcmp(command, MESSAGE_SEND) == 0) {
-		uint64_t zid;
-		if (convert_zid(argument, &zid)) {
-			if (payload != NULL) {
-				printf("Sending message (%s) to zigbee (0x%llX)\n", payload, zid);
-			} else {
-				printf("No payload specified\n");
-			}
-		} else {
-			printf("Invalid ZID (%s)\n", argument);
-		}
-	} else if (command != NULL && strcmp(command, MESSAGE_SUB) == 0) {
-		uint64_t channel_id;
-		char *remaining;
-		errno = 0;
+	char *f_cmd = strtok(message, MESSAGE_DELIMITER_S);
+	char *f_zid = strtok(NULL, MESSAGE_DELIMITER_S);
 
-		if (argument != NULL) {
-			channel_id = strtol(argument, &remaining, 10);
+	if (f_cmd == NULL || f_zid == NULL) {
+		printf("Malformed command\n");
+		return false;
+	}
+
+	uint64_t v_zid;
+	if (convert_zid(f_zid, &v_zid)) {
+		printf("Invalid ZID (%s)\n", f_zid);
+		return false;
+	}
+
+	if (strcmp(f_cmd, MESSAGE_SEND) == 0) {
+		char *f_msgid = strtok(NULL, MESSAGE_DELIMITER_S);
+		char *f_msglen = strtok(NULL, MESSAGE_DELIMITER_S);
+		char *f_msg = strtok(NULL, MESSAGE_DELIMITER_S);
+
+		if (f_msgid == NULL || f_msglen == NULL || f_msg == NULL) {
+			printf("Malformed 'send' command\n");
+			return false;
 		}
-		if (argument == NULL || *remaining != '\0' || errno) {
-			printf("Invalid channel number\n");
-			if (errno) {
-				perror("strtol");
+
+		unsigned int v_msglen;
+		if (!convert_msglen(f_msglen, &v_msglen)) return false;
+
+		if (strlen(f_msg) != v_msglen && v_msglen > 0) {
+			printf("Message payload is too short\n");
+			return false;
+		}
+
+		printf("Sending message (%s) to zigbee (0x%llX)\n", f_msg, v_zid);
+		return true;
+	} else if (strcmp(f_cmd, MESSAGE_SUB) == 0) {
+		node_t *channel_node = find_channel_by_id(channels, v_zid);
+		if (channel_node == NULL) {
+			// Couldn't find the specified channel, so create it
+			channel_t *channel = create_channel(v_zid);
+			if (channel == NULL) {
+				printf("Couldn't create channel (%lld)\n", v_zid);
+				return false;
 			}
-		} else {
-			node_t *channel_node = find_channel_by_id(channels, channel_id);
+			channel_node = create_node(channels);
 			if (channel_node == NULL) {
-				// Couldn't find the specified channel, so create it
-				channel_t *channel = create_channel(channel_id);
-				if (channel == NULL) {
-					printf("Couldn't create channel (%lld)\n", channel_id);
-					return;
-				}
-				channel_node = create_node(channels);
-				if (channel_node == NULL) {
-					printf("Couldn't create channel (%lld)\n", channel_id);
-					return;
-				}
-				channel_node->data = channel;
-				printf("Created channel (%lld)\n", channel_id);
-			} else {
-				// Check to make sure that the client hasn't
-				// already subscribed to this channel
-				destroy_node_by_fd(((channel_t *)channel_node->data)->subscribers, ((connection *)client->data)->h_socket);
+				printf("Couldn't create channel (%lld)\n", v_zid);
+				return false;
 			}
-
-			node_t *subscriber_node = create_node(((channel_t *)channel_node->data)->subscribers);
-			if (subscriber_node == NULL) {
-				printf("Couldn't add subscriber to channel\n");
-				return;
-			}
-			printf("Subscribed %p to channel %lld\n", client, channel_id);
-			subscriber_node->data = client->data;
-
-			printf("%d clients subscribed to channel %lld\n", ((channel_t *)channel_node->data)->subscribers->count, channel_id);
+			channel_node->data = channel;
+			printf("Created channel (%lld)\n", v_zid);
+		} else {
+			// Check to make sure that the client hasn't
+			// already subscribed to this channel
+			destroy_node_by_fd(((channel_t *)channel_node->data)->subscribers, ((connection *)client->data)->h_socket);
 		}
+
+		node_t *subscriber_node = create_node(((channel_t *)channel_node->data)->subscribers);
+		if (subscriber_node == NULL) {
+			printf("Couldn't add subscriber to channel\n");
+			return false;
+		}
+		printf("Subscribed %p to channel %lld\n", client, v_zid);
+		subscriber_node->data = client->data;
+
+		printf("%d clients subscribed to channel %lld\n", ((channel_t *)channel_node->data)->subscribers->count, v_zid);
+		return true;
 	} else {
-		printf("Unrecognized command '%s'\n", command);
+		printf("Unrecognized command '%s'\n", f_cmd);
+		return false;
 	}
 }
 
@@ -454,23 +467,42 @@ node_t *find_channel_by_id(root_node_t *root, uint64_t id) {
 }
 
 // Note: This assumes that the 'long' type is at least 8 bytes
-int convert_zid(char *strzid, uint64_t *zid) {
+bool convert_zid(char *strzid, uint64_t *zid) {
 	char *end;
-	long tzid;
+	long long tzid;
 
 	errno = 0;
-	tzid = strtol(strzid, &end, 16);
+	tzid = strtoll(strzid, &end, 16);
 
 	if (errno || *end != '\0' || strlen(strzid) != 16) {
 		printf("Invalid Zigbee Address\n");
 		if (errno) {
-			perror("strtol");
+			perror("strtoll()");
 		}
-		return 0;
+		return false;
 	}
 
-	*zid = tzid;
-	return 1;
+	*zid = (uint64_t)tzid;
+	return true;
+}
+
+bool convert_msglen(char *strmsglen, unsigned int *msglen) {
+	char *end;
+	long tmsglen;
+
+	errno = 0;
+	tmsglen = strtol(strmsglen, &end, 10);
+
+	if (errno || *end != '\0') {
+		printf("Invalid Message Length\n");
+		if (errno) {
+			perror("strtol()");
+		}
+		return false;
+	}
+
+	*msglen = (unsigned int)tmsglen;
+	return true;
 }
 
 void destroy_node_by_fd(root_node_t *root, int fd) {
