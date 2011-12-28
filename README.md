@@ -19,7 +19,7 @@ the call will fail.
 
 <pre>
 +-----+--------+-------------+--------------+------------------+-----------+
-| '$' | 'send' | <zigbee id> | <message id> | <message length> | <message> |
+| '$' | 'send' | (zigbee id) | (message id) | (message length) | (message) |
 +-----+--------+-------------+--------------+------------------+-----------+
 </pre>
 
@@ -30,7 +30,7 @@ exist (so be careful).
 
 <pre>
 +-----+-------+-------------+
-| '$' | 'sub' | <zigbee id> |
+| '$' | 'sub' | (zigbee id) |
 +-----+-------+-------------+
 </pre>
 
@@ -41,7 +41,7 @@ specified message id is returned as well as the operation's result ('true'/
 
 <pre>
 +-----+-------+--------------+----------+----------------+
-| '$' | 'res' | <message id> | <result> | <error string> |
+| '$' | 'res' | (message id) | (result) | (error string) |
 +-----+-------+--------------+----------+----------------+
 </pre>
 
