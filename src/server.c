@@ -15,7 +15,8 @@
 #include "connection.h"
 #include "channel.h"
 
-#define DEBUG
+#define DEBUG 1
+#define NO_HARDWARE 1
 
 static const int MAX_PENDING = 5;
 static const int READ_BUF_LEN = 100;
@@ -409,6 +410,10 @@ bool process_client_message(root_node_t *channels, node_t *client, char *message
 		}
 
 		printf("Sending message (%s) to zigbee (0x%llX)\n", f_msg, v_zid);
+#if NO_HARDWARE
+		send_response(((connection *)client->data)->h_socket, NULL, NULL);
+#else
+#endif
 		return true;
 	} else if (strcmp(f_cmd, MESSAGE_SUB) == 0) {
 		node_t *channel_node = find_channel_by_id(channels, v_zid);
@@ -599,7 +604,7 @@ bool send_response(int fd, char *msgid, char *errorstr) {
 
 void handle_node_connected(xbapi_node_identification_t *node, void *user_data) {
 	(void)user_data;
-#ifdef DEBUG
+#if DEBUG
 	printf("Source Address: %llX\n", node->source_address);
 	printf("Source Network Address: %X\n", node->source_network_address);
 	switch (node->receive_options) {
@@ -650,7 +655,7 @@ void handle_node_connected(xbapi_node_identification_t *node, void *user_data) {
 
 void handle_transmit_completed(xbapi_tx_status_t *status, void *user_data) {
 	(void)user_data;
-#ifdef DEBUG
+#if DEBUG
 	printf("Delivery Network Address: %X\n", status->delivery_network_address);
 	printf("Retry Count: %d\n", status->retry_count);
 	switch (status->delivery_status) {
@@ -734,7 +739,7 @@ void handle_transmit_completed(xbapi_tx_status_t *status, void *user_data) {
 }
 
 void handle_received_packet(xbapi_rx_packet_t *packet, void *user_data) {
-#ifdef DEBUG
+#if DEBUG
 	printf("Source Address: %llX\n", packet->source_address);
 	printf("Source Network Address: %X\n", packet->source_network_address);
 	switch(packet->options) {
@@ -783,7 +788,7 @@ void handle_received_packet(xbapi_rx_packet_t *packet, void *user_data) {
 
 void handle_modem_changed(xbapi_modem_status_e status, void *user_data) {
 	(void)user_data;
-#ifdef DEBUG
+#if DEBUG
 	switch (status) {
 		case XBAPI_MODEM_HARDWARE_RESET:
 			printf("Modem Changed: Hardware Reset\n");
@@ -823,7 +828,7 @@ void handle_modem_changed(xbapi_modem_status_e status, void *user_data) {
 bool handle_operation_completed(xbapi_op_t *op, void *user_data) {
 	(void)user_data;
 	(void)op;
-#ifdef DEBUG
+#if DEBUG
 	printf("Operation completed\n\n");
 #endif
 	return false;
