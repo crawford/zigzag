@@ -70,8 +70,9 @@ int main(int argc, char **argv) {
 	root_node_t *clients;
 	root_node_t *channels;
 
-	xbapi_op_set_t *op_set = xbapi_init_op_set();
+#if !NO_HARDWARE
 	xbapi_conn_t *conn = NULL;
+	xbapi_op_set_t *op_set = xbapi_init_op_set();
 	xbapi_callbacks_t callbacks = {
 		.node_connected = &handle_node_connected,
 		.transmit_completed = &handle_transmit_completed,
@@ -79,6 +80,7 @@ int main(int argc, char **argv) {
 		.modem_changed = &handle_modem_changed,
 		.operation_completed = &handle_operation_completed
 	};
+#endif
 
 	if (signal(SIGINT, handle_sigterm) == SIG_ERR) {
 		perror("signal()");
@@ -90,7 +92,7 @@ int main(int argc, char **argv) {
 	}
 
 	if (argc != 2) {
-		fprintf(stderr, "Usage: %s config_file\n", argv[0]);
+		fprintf(stderr, "Usage: %s serial_pipe\n", argv[0]);
 		exit_with_cleanup(-1, 0);
 	}
 
@@ -121,6 +123,17 @@ int main(int argc, char **argv) {
 	}
 
 	h_sock = setup_listening_socket(listenAddr, listenPort);
+
+#if NO_HARDWARE
+	h_zigbee = 0;
+
+	fds = malloc(sizeof(struct pollfd));
+	if (fds == NULL) {
+		perror("malloc()");
+		exit_with_cleanup(-1, h_config, h_sock, h_zigbee);
+	}
+	nfds = 1;
+#else
 	h_zigbee = setup_serial_connection(argv[1]);
 	if (h_sock < 0 || h_zigbee < 0) exit_with_cleanup(-1, h_config, h_sock, h_zigbee);
 	conn = xbapi_init_conn(h_zigbee);
@@ -132,11 +145,13 @@ int main(int argc, char **argv) {
 	}
 	nfds = 2;
 
+	fds[1].fd = h_zigbee;
+	fds[1].events = POLLIN;
+#endif
+
 	fds[0].fd = h_sock;
 	fds[0].events = POLLIN;
 
-	fds[1].fd = h_zigbee;
-	fds[1].events = POLLIN;
 
 
 	while (running) {
@@ -165,6 +180,7 @@ int main(int argc, char **argv) {
 			result--;
 		}
 
+#if !NO_HARDWARE
 		fd++;
 		// Check the second file descriptor (the zigbee pipe) for readable
 		if (fd->revents) {
@@ -176,6 +192,7 @@ int main(int argc, char **argv) {
 			}
 			result--;
 		}
+#endif
 
 		// Check the remaining file descriptors (the client sockets) for events
 		char dirty = 0;
