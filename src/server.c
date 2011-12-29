@@ -292,19 +292,31 @@ bool append_to_fds(struct pollfd **fds, nfds_t *size, int fd) {
 }
 
 bool rebuild_fds(struct pollfd **fds, nfds_t *size, root_node_t *clients) {
+#if NO_HARDWARE
+	struct pollfd *new = realloc(*fds, (clients->count + 1) * sizeof(struct pollfd));
+#else
 	struct pollfd *new = realloc(*fds, (clients->count + 2) * sizeof(struct pollfd));
+#endif
 	if (new == NULL) {
 		perror("malloc()");
 		return false;
 	}
 
 	*fds = new;
+#if NO_HARDWARE
+	*size = clients->count + 1;
+#else
 	*size = clients->count + 2;
+#endif
 
 	// Iterate through all of the connected nodes and create file descriptor
 	// entries for them.
 	node_t *node = clients->head;
+#if NO_HARDWARE
+	struct pollfd *fd = *fds + 1;
+#else
 	struct pollfd *fd = *fds + 2;
+#endif
 	while (node != NULL) {
 		fd->fd = ((connection *)node->data)->h_socket;
 		fd->events = POLLIN;
@@ -400,7 +412,7 @@ bool process_client_message(root_node_t *channels, node_t *client, char *message
 	}
 
 	uint64_t v_zid;
-	if (convert_zid(f_zid, &v_zid)) {
+	if (!convert_zid(f_zid, &v_zid)) {
 		printf("Invalid ZID (%s)\n", f_zid);
 		send_response(((connection *)client->data)->h_socket, NULL, "invalid ZID");
 		return false;
@@ -420,10 +432,12 @@ bool process_client_message(root_node_t *channels, node_t *client, char *message
 		unsigned int v_msglen;
 		if (!convert_msglen(f_msglen, &v_msglen)) return false;
 
-		if (strlen(f_msg) != v_msglen && v_msglen > 0) {
+		if (strlen(f_msg) < v_msglen || v_msglen == 0) {
 			printf("Message payload is too short\n");
 			send_response(((connection *)client->data)->h_socket, NULL, "message payload is too short");
 			return false;
+		} else if (strlen(f_msg) > v_msglen) {
+			f_msg[v_msglen] = '\0';
 		}
 
 		printf("Sending message (%s) to zigbee (0x%llX)\n", f_msg, v_zid);
@@ -591,9 +605,9 @@ bool send_response(int fd, char *msgid, char *errorstr) {
 	const char *resstr = (errorstr == NULL) ? MESSAGE_TRUE : MESSAGE_FALSE;
 
 	size_t res_len = strlen(MESSAGE_RES);
-	size_t msgid_len = strlen(msgid);
+	size_t msgid_len = (msgid == NULL) ? 0 : strlen(msgid);
 	size_t resstr_len = strlen(resstr);
-	size_t errorstr_len = strlen(errorstr);
+	size_t errorstr_len = (errorstr == NULL) ? 0 : strlen(errorstr);
 
 	size_t response_len = 5 + res_len + msgid_len + resstr_len + errorstr_len;
 	char *response = malloc(sizeof(char) * response_len);
