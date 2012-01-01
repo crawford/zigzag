@@ -40,7 +40,7 @@ node_t *find_client_by_fd(root_node_t *, int);
 node_t *find_channel_by_id(root_node_t *, uint64_t);
 bool convert_zid(char *, uint64_t *);
 bool convert_msglen(char *, unsigned int *);
-void destroy_node_by_fd(root_node_t *, int);
+node_t *find_node_by_fd(root_node_t *, int);
 void disconnect(root_node_t *, root_node_t *, int);
 void exit_with_cleanup(int, int, ...);
 bool send_response(int, char *, char *);
@@ -51,6 +51,10 @@ void handle_received_packet(xbapi_rx_packet_t *packet, void *user_data);
 void handle_modem_changed(xbapi_modem_status_e status, void *user_data);
 bool handle_operation_completed(xbapi_op_t *op, void *user_data);
 
+typedef struct {
+	connection_t *conn;
+	char *msgid;
+} op_data_t;
 
 
 char running = 1;
@@ -261,13 +265,22 @@ int accept_connection(int h_sock, root_node_t *clients) {
 		return -1;
 	}
 
-	node->data = malloc(sizeof(connection));
+	node->data = malloc(sizeof(connection_t));
 	if (node->data == NULL) {
 		perror("malloc()");
 		destroy_node(clients, node);
 		return -1;
 	}
-	((connection *)node->data)->h_socket = h_client;
+	connection_t *conn = node->data;
+	conn->h_socket = h_client;
+	conn->pending_operations = malloc(sizeof(root_node_t));
+	if (conn->pending_operations == NULL) {
+		perror("malloc()");
+		free(node->data);
+		destroy_node(clients, node);
+		return -1;
+	}
+	memset(conn->pending_operations, 0, sizeof(root_node_t));
 
 	printf("Accepted client %d\n", clients->count);
 
@@ -320,7 +333,7 @@ bool rebuild_fds(struct pollfd **fds, nfds_t *size, root_node_t *clients) {
 	struct pollfd *fd = *fds + 2;
 #endif
 	while (node != NULL) {
-		fd->fd = ((connection *)node->data)->h_socket;
+		fd->fd = ((connection_t *)node->data)->h_socket;
 		fd->events = POLLIN;
 
 		fd++;
@@ -409,14 +422,14 @@ bool process_client_message(xbapi_conn_t *conn, xbapi_op_set_t *opset, root_node
 
 	if (f_cmd == NULL || f_zid == NULL) {
 		printf("Malformed command\n");
-		send_response(((connection *)client->data)->h_socket, NULL, "malformed command");
+		send_response(((connection_t *)client->data)->h_socket, NULL, "malformed command");
 		return false;
 	}
 
 	uint64_t v_zid;
 	if (!convert_zid(f_zid, &v_zid)) {
 		printf("Invalid ZID (%s)\n", f_zid);
-		send_response(((connection *)client->data)->h_socket, NULL, "invalid ZID");
+		send_response(((connection_t *)client->data)->h_socket, NULL, "invalid ZID");
 		return false;
 	}
 
@@ -427,7 +440,7 @@ bool process_client_message(xbapi_conn_t *conn, xbapi_op_set_t *opset, root_node
 
 		if (f_msgid == NULL || f_msglen == NULL || f_msg == NULL) {
 			printf("Malformed 'send' command\n");
-			send_response(((connection *)client->data)->h_socket, f_msgid, "malformed 'send' command");
+			send_response(((connection_t *)client->data)->h_socket, f_msgid, "malformed 'send' command");
 			return false;
 		}
 
@@ -436,7 +449,7 @@ bool process_client_message(xbapi_conn_t *conn, xbapi_op_set_t *opset, root_node
 
 		if (strlen(f_msg) < v_msglen || v_msglen == 0) {
 			printf("Message payload is too short\n");
-			send_response(((connection *)client->data)->h_socket, f_msgid, "message payload is too short");
+			send_response(((connection_t *)client->data)->h_socket, f_msgid, "message payload is too short");
 			return false;
 		} else if (strlen(f_msg) > v_msglen) {
 			f_msg[v_msglen] = '\0';
@@ -445,7 +458,7 @@ bool process_client_message(xbapi_conn_t *conn, xbapi_op_set_t *opset, root_node
 		// Copy the message into a talloc'd buffer
 		uint8_t *b_msg = talloc_array(NULL, uint8_t, v_msglen);
 		if (b_msg == NULL) {
-			send_response(((connection *)client->data)->h_socket, f_msgid, "internal error");
+			send_response(((connection_t *)client->data)->h_socket, f_msgid, "internal error");
 			return false;
 		}
 		memcpy(b_msg, f_msg, v_msglen);
@@ -454,20 +467,32 @@ bool process_client_message(xbapi_conn_t *conn, xbapi_op_set_t *opset, root_node
 #ifdef NO_HARDWARE
 		(void)conn;
 		(void)opset;
-		send_response(((connection *)client->data)->h_socket, f_msgid, NULL);
+		send_response(((connection_t *)client->data)->h_socket, f_msgid, NULL);
 #else
 		xbapi_op_t *op;
 		xbapi_rc_t rc = xbapi_transmit_data(conn, opset, b_msg, v_zid, &op);
+
 		size_t f_msgid_len = strlen(f_msgid);
 		char *b_msgid = malloc(sizeof(char) * f_msgid_len);
+		if (b_msgid == NULL) return false;
 		memcpy(b_msgid, f_msgid, f_msgid_len);
-		set_user_data(op, b_msgid);
-		if (xbapi_errno(rc) == XBAPI_ERR_NOERR) {
-			send_response(((connection *)client->data)->h_socket, f_msgid, NULL);
-		} else {
-			char *errout;
-			if (asprintf(&errout, "xbapi error (%s)", xbapi_strerror(rc)) != -1) {
-				send_response(((connection *)client->data)->h_socket, f_msgid, errout);
+
+		op_data_t *op_data = malloc(sizeof(op_data_t));
+		if (op_data == NULL) return false;
+		op_data->conn = client->data;
+		op_data->msgid = b_msgid;
+
+		set_user_data(op, op_data);
+		if (!add_operation_to_connection((connection_t *)client->data, op)) {
+			perror("add_operation_to_connection()");
+			return false;
+		}
+
+		if (xbapi_errno(rc) != XBAPI_ERR_NOERR) {
+			static const size_t ERROUT_LEN = 50;
+			char errout[ERROUT_LEN];
+			if (snprintf(errout, ERROUT_LEN, "xbapi error (%s)", xbapi_strerror(rc)) != -1) {
+				send_response(((connection_t *)client->data)->h_socket, f_msgid, errout);
 				free(errout);
 			}
 		}
@@ -480,13 +505,13 @@ bool process_client_message(xbapi_conn_t *conn, xbapi_op_set_t *opset, root_node
 			channel_t *channel = create_channel(v_zid);
 			if (channel == NULL) {
 				printf("Couldn't create channel (%lld)\n", v_zid);
-				send_response(((connection *)client->data)->h_socket, NULL, "internal error");
+				send_response(((connection_t *)client->data)->h_socket, NULL, "internal error");
 				return false;
 			}
 			channel_node = create_node(channels);
 			if (channel_node == NULL) {
 				printf("Couldn't create channel (%lld)\n", v_zid);
-				send_response(((connection *)client->data)->h_socket, NULL, "internal error");
+				send_response(((connection_t *)client->data)->h_socket, NULL, "internal error");
 				return false;
 			}
 			channel_node->data = channel;
@@ -494,24 +519,25 @@ bool process_client_message(xbapi_conn_t *conn, xbapi_op_set_t *opset, root_node
 		} else {
 			// Check to make sure that the client hasn't
 			// already subscribed to this channel
-			destroy_node_by_fd(((channel_t *)channel_node->data)->subscribers, ((connection *)client->data)->h_socket);
+			root_node_t *root = ((channel_t *)channel_node->data)->subscribers;
+			destroy_node(root, find_node_by_fd(root, ((connection_t *)client->data)->h_socket));
 		}
 
 		node_t *subscriber_node = create_node(((channel_t *)channel_node->data)->subscribers);
 		if (subscriber_node == NULL) {
 			printf("Couldn't add subscriber to channel\n");
-			send_response(((connection *)client->data)->h_socket, NULL, "internal error");
+			send_response(((connection_t *)client->data)->h_socket, NULL, "internal error");
 			return false;
 		}
 		printf("Subscribed %p to channel %lld\n", client, v_zid);
 		subscriber_node->data = client->data;
 
 		printf("%d clients subscribed to channel %lld\n", ((channel_t *)channel_node->data)->subscribers->count, v_zid);
-		send_response(((connection *)client->data)->h_socket, NULL, NULL);
+		send_response(((connection_t *)client->data)->h_socket, NULL, NULL);
 		return true;
 	} else {
 		printf("Unrecognized command '%s'\n", f_cmd);
-		send_response(((connection *)client->data)->h_socket, NULL, "unrecognized command");
+		send_response(((connection_t *)client->data)->h_socket, NULL, "unrecognized command");
 		return false;
 	}
 }
@@ -520,7 +546,7 @@ node_t *find_client_by_fd(root_node_t *root, int fd) {
 	node_t *node = root->head;
 
 	while (node != NULL) {
-		if (((connection *)node->data)->h_socket == fd) {
+		if (((connection_t *)node->data)->h_socket == fd) {
 			return node;
 		}
 		node = node->next;
@@ -581,23 +607,31 @@ bool convert_msglen(char *strmsglen, unsigned int *msglen) {
 	return true;
 }
 
-void destroy_node_by_fd(root_node_t *root, int fd) {
-	node_t *next = root->head;
-	while (next != NULL) {
-		node_t *cur = next;
-		next = cur->next;
-
-		if (((connection *)cur->data)->h_socket == fd) {
-			destroy_node(root, cur);
-			return;
+node_t *find_node_by_fd(root_node_t *root, int fd) {
+	node_t *node = root->head;
+	while (node != NULL) {
+		if (((connection_t *)node->data)->h_socket == fd) {
+			return node;
 		}
+		node = node->next;
 	}
+	return NULL;
 }
 
 void disconnect(root_node_t *clients, root_node_t *channels, int fd) {
 	printf("Disconnected\n");
 
-	destroy_node_by_fd(clients, fd);
+	node_t *client = find_node_by_fd(clients, fd);
+
+	// Set each of the operation's user_data to NULL to prevent the callback from segfaulting
+	node_t *op = ((connection_t *)client->data)->pending_operations->head;
+	while (op != NULL) {
+		set_user_data((xbapi_op_t *)op->data, NULL);
+		op = op->next;
+	}
+
+	destroy_connection(client->data);
+	destroy_node(clients, client);
 
 	// Remove the client from all of the channel subscriptions
 	node_t *next = channels->head;
@@ -605,7 +639,8 @@ void disconnect(root_node_t *clients, root_node_t *channels, int fd) {
 		node_t *cur = next;
 		next = cur->next;
 
-		destroy_node_by_fd(((channel_t *)cur->data)->subscribers, fd);
+		root_node_t *root = ((channel_t *)cur->data)->subscribers;
+		destroy_node(root, find_node_by_fd(root, fd));
 
 		// Remove the channel if it is empty
 		if (((channel_t *)cur->data)->subscribers->count == 0) {
@@ -835,7 +870,7 @@ void handle_received_packet(xbapi_rx_packet_t *packet, void *user_data) {
 			uint8_t *data = packet->data;
 			ssize_t ret;
 			do {
-				ret = send(((connection *)client->data)->h_socket, data, data_len, 0);
+				ret = send(((connection_t *)client->data)->h_socket, data, data_len, 0);
 				if (ret < 0) {
 					perror("send()");
 					break;
@@ -891,10 +926,16 @@ void handle_modem_changed(xbapi_modem_status_e status, void *user_data) {
 
 bool handle_operation_completed(xbapi_op_t *op, void *user_data) {
 	(void)user_data;
-	(void)op;
 #ifdef DEBUG
 	printf("Operation completed\n\n");
 #endif
-	return false;
+	op_data_t *data = user_data_from_operation(op);
+
+	if (data != NULL) {
+		send_response(data->conn->h_socket, data->msgid, NULL);
+		remove_operation_from_connection(data->conn, op);
+	}
+
+	return true;
 }
 
