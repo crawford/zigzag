@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-channel_t *create_channel(int id) {
+channel_t *create_channel(uint64_t id) {
 	channel_t *channel = malloc(sizeof(channel_t));
 	if (channel == NULL)
 		return NULL;
