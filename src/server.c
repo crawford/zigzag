@@ -43,7 +43,8 @@ bool convert_msglen(char *, unsigned int *);
 node_t *find_node_by_fd(root_node_t *, int);
 void disconnect(root_node_t *, root_node_t *, int);
 void exit_with_cleanup(int, int, ...);
-bool send_response(int, char *, char *);
+void close_all_clients(root_node_t *);
+bool send_response(int, char *, const char *);
 
 void handle_node_connected(xbapi_node_identification_t *node, void *user_data);
 void handle_transmit_completed(xbapi_tx_status_t *status, void *user_data);
@@ -189,6 +190,11 @@ int main(int argc, char **argv) {
 		// Check the second file descriptor (the zigbee pipe) for readable
 		if (fd->revents) {
 			printf("xb (%d)\n", fd->revents);
+			if (fd->revents & POLLHUP) {
+				fprintf(stderr, "The Zigbee hung up. Performing full teardown\n");
+				close_all_clients(clients);
+				exit_with_cleanup(-1, h_config, h_sock, h_zigbee);
+			}
 			if (fd->revents & POLLIN) {
 				printf("xtb\n");
 				xbapi_rc_t rc = xbapi_process_data(conn, opset, &callbacks, channels);
@@ -663,7 +669,15 @@ void exit_with_cleanup(int code, int fd, ...) {
 	exit(code);
 }
 
-bool send_response(int fd, char *msgid, char *errorstr) {
+void close_all_clients(root_node_t *clients) {
+	node_t *node = clients->head;
+	while (node != NULL) {
+		close(((connection_t *)node->data)->h_socket);
+		node = node->next;
+	}
+}
+
+bool send_response(int fd, char *msgid, const char *errorstr) {
 	const char *resstr = (errorstr == NULL) ? MESSAGE_TRUE : MESSAGE_FALSE;
 
 	size_t res_len = strlen(MESSAGE_RES);
@@ -932,7 +946,16 @@ bool handle_operation_completed(xbapi_op_t *op, void *user_data) {
 	op_data_t *data = user_data_from_operation(op);
 
 	if (data != NULL) {
-		send_response(data->conn->h_socket, data->msgid, NULL);
+		switch (status_from_operation(op)) {
+			case XBAPI_OP_STATUS_SUCCESS:
+				send_response(data->conn->h_socket, data->msgid, NULL);
+				break;
+			case XBAPI_OP_STATUS_FAILURE:
+				send_response(data->conn->h_socket, data->msgid, xbapi_error_str_from_operation(op));
+				break;
+			default:
+				fprintf(stderr, "handle_operation_completed(): returned a pending status\n");
+		}
 		remove_operation_from_connection(data->conn, op);
 	}
 
