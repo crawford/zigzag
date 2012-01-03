@@ -189,14 +189,12 @@ int main(int argc, char **argv) {
 		fd++;
 		// Check the second file descriptor (the zigbee pipe) for readable
 		if (fd->revents) {
-			printf("xb (%d)\n", fd->revents);
 			if (fd->revents & POLLHUP) {
 				fprintf(stderr, "The Zigbee hung up. Performing full teardown\n");
 				close_all_clients(clients);
 				exit_with_cleanup(-1, h_config, h_sock, h_zigbee);
 			}
 			if (fd->revents & POLLIN) {
-				printf("xtb\n");
 				xbapi_rc_t rc = xbapi_process_data(conn, opset, &callbacks, channels);
 				if (xbapi_errno(rc) != XBAPI_ERR_NOERR) {
 					fprintf(stderr, "xbapi_process_data(): %s\n", xbapi_strerror(rc));
@@ -478,7 +476,7 @@ bool process_client_message(xbapi_conn_t *conn, xbapi_op_set_t *opset, root_node
 		xbapi_op_t *op;
 		xbapi_rc_t rc = xbapi_transmit_data(conn, opset, b_msg, v_zid, &op);
 
-		size_t f_msgid_len = strlen(f_msgid);
+		size_t f_msgid_len = strlen(f_msgid) + 1;
 		char *b_msgid = malloc(sizeof(char) * f_msgid_len);
 		if (b_msgid == NULL) return false;
 		memcpy(b_msgid, f_msgid, f_msgid_len);
