@@ -1,20 +1,20 @@
 #ifndef NODE_H
 #define NODE_H
 
-typedef struct node_ {
-	struct node_ *next;
-	struct node_ *prev;
+typedef struct _node {
+	struct _node *next;
+	struct _node *prev;
 	void *data;
-} node;
+} node_t;
 
 typedef struct {
-	node *head;
-	node *tail;
+	node_t *head;
+	node_t *tail;
 	int count;
-} node_root;
+} root_node_t;
 
-node *create_node(node_root *);
-void destroy_node(node_root *, node *);
+node_t *create_node(root_node_t *);
+void destroy_node(root_node_t *, node_t *);
 
 #endif
 

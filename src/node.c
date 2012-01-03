@@ -1,8 +1,8 @@
 #include <stdlib.h>
 #include "node.h"
 
-node *create_node(node_root *root) {
-	node *new = malloc(sizeof(node));
+node_t *create_node(root_node_t *root) {
+	node_t *new = malloc(sizeof(node_t));
 	if (new == NULL)
 		return NULL;
 
@@ -23,7 +23,7 @@ node *create_node(node_root *root) {
 	return new;
 }
 
-void destroy_node(node_root *root, node *node) {
+void destroy_node(root_node_t *root, node_t *node) {
 	if (node == NULL) {
 		return;
 	}

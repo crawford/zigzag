@@ -2,22 +2,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-channel *create_channel(int id) {
-	channel *channel = malloc(sizeof(channel));
+channel_t *create_channel(uint64_t id) {
+	channel_t *channel = malloc(sizeof(channel_t));
 	if (channel == NULL)
 		return NULL;
 
 	channel->id = id;
-	channel->subscribers = malloc(sizeof(node_root));
+	channel->subscribers = malloc(sizeof(root_node_t));
 	if (channel->subscribers == NULL) {
 		free(channel);
 		return NULL;
 	}
-	memset(channel->subscribers, 0, sizeof(node_root));
+	memset(channel->subscribers, 0, sizeof(root_node_t));
 	return channel;
 }
 
-void destroy_channel(channel *channel) {
+void destroy_channel(channel_t *channel) {
 	while (channel->subscribers->head != NULL) {
 		destroy_node(channel->subscribers, channel->subscribers->head);
 	}
